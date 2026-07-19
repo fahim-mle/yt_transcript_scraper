@@ -8,7 +8,7 @@ LOCAL_OUTPUT_DIR = "./output"
 # Mounted blob storage; reviewed files are ingested from here.
 BLOB_OUTPUT_DIR = os.getenv(
     "BLOB_OUTPUT_DIR",
-    "/media/ghost/Blog Storage/yt_transcripts",
+    "/media/ghost/Blob Storage/yt_transcripts",
 )
 
 # Stage 3 output — approved, ingested .md files stored here permanently.

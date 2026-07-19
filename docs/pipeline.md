@@ -52,7 +52,7 @@ Reads `dataset.jsonl`, applies the cleaning pipeline to each video's raw segment
 
 | Path | Contents |
 |---|---|
-| `/media/ghost/Blog Storage/yt_transcripts/<Channel>/<Title>.md` | Clean, paragraph-formatted transcript |
+| `/media/ghost/Blob Storage/yt_transcripts/<Channel>/<Title>.md` | Clean, paragraph-formatted transcript |
 | PostgreSQL `videos` | `status = 'cleaned'`, `word_count` updated |
 
 Already-existing files in blob storage are skipped.
@@ -70,7 +70,7 @@ Already-existing files in blob storage are skipped.
 | Flag | Default | Description |
 |---|---|---|
 | `--raw-dir DIR` | `./output` | Where to read `dataset.jsonl` |
-| `--blob-dir DIR` | `/media/ghost/Blog Storage/yt_transcripts` | Where to write clean `.md` files |
+| `--blob-dir DIR` | `/media/ghost/Blob Storage/yt_transcripts` | Where to write clean `.md` files |
 
 ---
 
@@ -104,7 +104,7 @@ Copies every `.md` file still in blob storage to `/srv/dbdata` and updates Postg
 
 | Flag | Default | Description |
 |---|---|---|
-| `--blob-dir DIR` | `/media/ghost/Blog Storage/yt_transcripts` | Source |
+| `--blob-dir DIR` | `/media/ghost/Blob Storage/yt_transcripts` | Source |
 | `--clean-dir DIR` | `/srv/dbdata/markdowns/yt_transcripts_structured` | Destination |
 
 ---
