@@ -2,21 +2,23 @@
 """
 YouTube Transcript Scraper — three-stage pipeline
 
-  scrape  →  raw files in ./output  +  PostgreSQL (status=raw)
-  clean   →  reviewed .md in blob storage  +  PostgreSQL (status=cleaned)
-  ingest  →  approved .md pushed to /srv/dbdata  +  PostgreSQL (status=ingested)
+  scrape    →  raw files in ./output  +  PostgreSQL (status=raw)
+  clean     →  reviewed .md in blob storage  +  PostgreSQL (status=cleaned)
+  ingest    →  approved .md pushed to /srv/dbdata  +  PostgreSQL (status=ingested)
+  setup-db  →  create database (if needed) and apply schema.sql
 
 Usage:
     python main.py scrape <URL_OR_FILE> [options]
     python main.py clean  [options]
     python main.py ingest [options]
+    python main.py setup-db
 
 Examples:
     python main.py scrape "https://www.youtube.com/@ChannelHandle"
     python main.py scrape urls.txt
     python main.py clean
     python main.py ingest
-    python main.py ingest --blob-dir "/media/ghost/Blog Storage/yt_transcripts"
+    python main.py setup-db
 """
 
 import argparse
@@ -304,6 +306,68 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     )
 
 
+# ── setup-db ──────────────────────────────────────────────────────────────
+
+def cmd_setup_db(args: argparse.Namespace) -> None:
+    """
+    Create the yt_transcripts database (if it doesn't exist) and apply schema.sql.
+    Reads DATABASE_URL from .env automatically.
+    """
+    import psycopg2
+    from urllib.parse import urlparse
+
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url or "user:password" in db_url:
+        logger.error(
+            "DATABASE_URL is not configured. Edit .env and set a real connection string, e.g.:\n"
+            "  DATABASE_URL=postgresql://ghost@localhost:5432/yt_transcripts"
+        )
+        return
+
+    schema_path = os.path.join(os.path.dirname(__file__), "database", "schema.sql")
+    schema_sql = open(schema_path, encoding="utf-8").read()
+
+    parsed = urlparse(db_url)
+    db_name = parsed.path.lstrip("/")
+
+    # Try connecting to target DB directly
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url)
+    except psycopg2.OperationalError as exc:
+        if "does not exist" in str(exc):
+            # Database doesn't exist yet — try creating it via the postgres maintenance DB
+            maint_url = db_url.replace(parsed.path, "/postgres")
+            try:
+                mconn = psycopg2.connect(maint_url)
+                mconn.autocommit = True
+                with mconn.cursor() as cur:
+                    cur.execute(f'CREATE DATABASE "{db_name}"')
+                mconn.close()
+                logger.info("Created database: %s", db_name)
+                conn = psycopg2.connect(db_url)
+            except Exception as ce:
+                logger.error(
+                    "Could not create database '%s': %s\n"
+                    "Create it manually first:  createdb %s",
+                    db_name, ce, db_name,
+                )
+                return
+        else:
+            logger.error("Cannot connect: %s\nCheck DATABASE_URL in .env", exc)
+            return
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(schema_sql)
+        logger.info("Schema applied to '%s'. Tables: videos, video_audit_log.", db_name)
+    except Exception as exc:
+        logger.error("Failed to apply schema: %s", exc)
+    finally:
+        conn.close()
+
+
 # ── CLI wiring ────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -333,12 +397,20 @@ def build_parser() -> argparse.ArgumentParser:
     ip.add_argument("--blob-dir",  default=config.BLOB_OUTPUT_DIR)
     ip.add_argument("--clean-dir", default=config.CLEAN_OUTPUT_DIR)
 
+    # setup-db
+    sub.add_parser("setup-db", help="Create database and apply schema (reads DATABASE_URL from .env)")
+
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    {"scrape": cmd_scrape, "clean": cmd_clean, "ingest": cmd_ingest}[args.command](args)
+    {
+        "scrape":    cmd_scrape,
+        "clean":     cmd_clean,
+        "ingest":    cmd_ingest,
+        "setup-db":  cmd_setup_db,
+    }[args.command](args)
 
 
 if __name__ == "__main__":

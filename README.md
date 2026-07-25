@@ -29,21 +29,24 @@ pip install -r requirements.txt
 # Copy and fill in your environment variables
 cp .env.example .env
 
-# Apply the database schema
-psql $DATABASE_URL -f database/schema.sql
+# Apply the database schema (reads DATABASE_URL from .env automatically)
+python main.py setup-db
 
 # Scrape a channel
 python main.py scrape "https://www.youtube.com/@ChannelHandle"
 
 # Clean and push to structured storage
 python main.py clean
+
+# Or launch the web UI
+uvicorn server:app --reload --port 8000
 ```
 
 See [docs/setup.md](docs/setup.md) for full installation instructions.
 
 ## Output structure
 
-```
+```text
 ./output/                                          # staging (temp)
   <Channel>/
     <Title>.md                                     # raw timestamped transcript

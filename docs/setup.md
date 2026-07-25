@@ -28,13 +28,25 @@ CLEAN_OUTPUT_DIR=/srv/dbdata/markdowns/yt_transcripts_structured
 
 ## Database setup
 
-Run the schema against your PostgreSQL instance once:
+First update your `.env` with a real PostgreSQL connection string (the default has a placeholder):
 
-```bash
-psql $DATABASE_URL -f database/schema.sql
+```env
+# Example for peer auth (Ubuntu default — no password needed for your own user)
+DATABASE_URL=postgresql://localhost/yt_transcripts
+
+# Or with explicit credentials
+DATABASE_URL=postgresql://ghost:yourpassword@localhost:5432/yt_transcripts
 ```
 
-This creates the `videos` table, `video_audit_log` table, and all indexes. The script is idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`).
+Then run:
+
+```bash
+python main.py setup-db
+```
+
+This reads `DATABASE_URL` from `.env` automatically, creates the database if it doesn't exist, and applies `schema.sql` — creating the `videos` table, `video_audit_log` table, and all indexes. Idempotent; safe to re-run.
+
+**Why not `psql $DATABASE_URL -f database/schema.sql`?** The shell doesn't source `.env` automatically, so `$DATABASE_URL` is empty unless you export it manually. The `setup-db` command avoids this by loading `.env` via python-dotenv.
 
 ## Quick start
 
