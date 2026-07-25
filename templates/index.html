@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YT Transcript Scraper</title>
+  <style>
+    :root {
+      --bg:       #0f1117;
+      --surface:  #1a1d27;
+      --border:   #252836;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --accent:   #6366f1;
+      --accent-h: #818cf8;
+      --green:    #22c55e;
+      --yellow:   #f59e0b;
+      --red:      #ef4444;
+      --log-bg:   #0a0c12;
+      --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Header ────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    header h1 em { font-style: normal; color: var(--accent); }
+
+    #status-bar { display: flex; gap: 20px; }
+
+    .s-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+    }
+    .dot.ok   { background: var(--green); }
+    .dot.warn { background: var(--yellow); }
+    .dot.err  { background: var(--red); }
+
+    /* ── Main layout ───────────────────────────── */
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 14px;
+      overflow: hidden;
+    }
+
+    .top-row {
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .panel-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    /* ── Input panel ───────────────────────────── */
+    .url-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    input[type="text"] {
+      flex: 1;
+      background: var(--log-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 11px;
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+      min-width: 0;
+    }
+    input[type="text"]:focus  { border-color: var(--accent); }
+    input[type="text"]::placeholder { color: var(--muted); }
+
+    .btn {
+      padding: 7px 14px;
+      border-radius: 6px;
+      border: none;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.12s, opacity 0.12s;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-h); }
+
+    .btn-secondary { background: var(--border); color: var(--text); }
+    .btn-secondary:hover:not(:disabled) { background: #2e3244; }
+
+    .stage-row { display: flex; gap: 8px; align-items: center; }
+
+    #job-indicator {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--muted);
+      display: none;
+      align-items: center;
+      gap: 6px;
+    }
+    #job-indicator.visible { display: flex; }
+
+    .spinner {
+      width: 12px; height: 12px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.65s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Log panel ─────────────────────────────── */
+    #log-output {
+      background: var(--log-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      height: 148px;
+      overflow-y: auto;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      line-height: 1.65;
+      color: #94a3b8;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* ── Videos section ────────────────────────── */
+    .videos-wrap {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .videos-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .videos-head .panel-label { margin-bottom: 0; }
+
+    #video-count { font-size: 11px; color: var(--muted); }
+
+    .table-scroll { overflow-y: auto; flex: 1; }
+
+    table { width: 100%; border-collapse: collapse; }
+
+    thead th {
+      position: sticky; top: 0;
+      background: #1c1f2e;
+      padding: 7px 16px;
+      text-align: left;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(99,102,241,0.04); }
+
+    td {
+      padding: 9px 16px;
+      font-size: 12.5px;
+      color: var(--text);
+      vertical-align: middle;
+    }
+
+    td.dim { color: var(--muted); }
+
+    .cell-title {
+      max-width: 360px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    td a {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 15px;
+      line-height: 1;
+    }
+    td a:hover { color: var(--accent-h); }
+
+    .empty-msg {
+      padding: 48px 20px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    #error-toast {
+      display: none;
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #3b0a0a;
+      border: 1px solid var(--red);
+      color: #fca5a5;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      z-index: 100;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>YT <em>Transcript</em> Scraper</h1>
+  <div id="status-bar">
+    <div class="s-item"><span class="dot" id="dot-db"></span><span id="lbl-db">DB</span></div>
+    <div class="s-item"><span class="dot" id="dot-blob"></span><span id="lbl-blob">Blob</span></div>
+    <div class="s-item"><span class="dot" id="dot-clean"></span><span id="lbl-clean">Storage</span></div>
+  </div>
+</header>
+
+<main>
+  <div class="top-row">
+
+    <!-- Controls -->
+    <div class="panel">
+      <div class="panel-label">Pipeline</div>
+      <div class="url-row">
+        <input type="text" id="url-input"
+               placeholder="YouTube URL, playlist, or channel…"
+               onkeydown="if(event.key==='Enter') scrape()">
+        <button class="btn btn-primary" id="btn-scrape" onclick="scrape()">Scrape</button>
+      </div>
+      <div class="stage-row">
+        <button class="btn btn-secondary" id="btn-clean"  onclick="runStage('clean')">Clean</button>
+        <button class="btn btn-secondary" id="btn-ingest" onclick="runStage('ingest')">Ingest</button>
+        <div id="job-indicator">
+          <div class="spinner"></div>
+          <span id="job-label">running…</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Log -->
+    <div class="panel">
+      <div class="panel-label">Log</div>
+      <pre id="log-output">Waiting for jobs…</pre>
+    </div>
+
+  </div>
+
+  <!-- Videos table -->
+  <div class="videos-wrap">
+    <div class="videos-head">
+      <div class="panel-label">Scraped Videos</div>
+      <span id="video-count">—</span>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Title</th>
+            <th>Channel</th>
+            <th>Published</th>
+            <th>Words</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<div id="error-toast"></div>
+
+<script>
+  let _es = null;
+  let _running = false;
+
+  // ── Helpers ──────────────────────────────────────────────────────
+
+  function esc(s) {
+    return String(s || '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function setRunning(on, label) {
+    _running = on;
+    ['btn-scrape','btn-clean','btn-ingest'].forEach(id => {
+      document.getElementById(id).disabled = on;
+    });
+    const ind = document.getElementById('job-indicator');
+    ind.className = on ? 'visible' : '';
+    if (label) document.getElementById('job-label').textContent = label + '…';
+  }
+
+  function appendLog(text) {
+    const el = document.getElementById('log-output');
+    const atBottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 8;
+    el.textContent += text + '\n';
+    if (atBottom) el.scrollTop = el.scrollHeight;
+  }
+
+  function clearLog() {
+    document.getElementById('log-output').textContent = '';
+  }
+
+  function showError(msg) {
+    const t = document.getElementById('error-toast');
+    t.textContent = msg;
+    t.style.display = 'block';
+    setTimeout(() => { t.style.display = 'none'; }, 4000);
+  }
+
+  // ── SSE stream ───────────────────────────────────────────────────
+
+  function streamJob(jobId, label) {
+    if (_es) _es.close();
+    clearLog();
+    setRunning(true, label);
+
+    _es = new EventSource(`/api/jobs/${jobId}/stream`);
+
+    _es.onmessage = e => appendLog(e.data);
+
+    _es.addEventListener('done', () => {
+      _es.close();
+      setRunning(false);
+      loadVideos();
+    });
+
+    _es.onerror = () => {
+      _es.close();
+      setRunning(false);
+      appendLog('[Connection closed]');
+      loadVideos();
+    };
+  }
+
+  // ── Actions ──────────────────────────────────────────────────────
+
+  function scrape() {
+    if (_running) return;
+    const url = document.getElementById('url-input').value.trim();
+    if (!url) { showError('Paste a YouTube URL first.'); return; }
+
+    fetch('/api/scrape', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url}),
+    })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { showError(d.error); return; }
+      streamJob(d.job_id, 'scraping');
+    })
+    .catch(e => showError(String(e)));
+  }
+
+  function runStage(stage) {
+    if (_running) return;
+    fetch(`/api/${stage}`, {method: 'POST'})
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { showError(d.error); return; }
+        streamJob(d.job_id, stage + 'ing');
+      })
+      .catch(e => showError(String(e)));
+  }
+
+  // ── Videos table ─────────────────────────────────────────────────
+
+  function loadVideos() {
+    fetch('/api/videos')
+      .then(r => r.json())
+      .then(videos => {
+        const tbody = document.getElementById('tbody');
+        const count = document.getElementById('video-count');
+        count.textContent = videos.length + ' video' + (videos.length !== 1 ? 's' : '');
+
+        if (!videos.length) {
+          tbody.innerHTML =
+            '<tr><td colspan="5" class="empty-msg">No videos yet — paste a URL and click Scrape.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = videos.map(v => `
+          <tr>
+            <td class="cell-title" title="${esc(v.title)}">${esc(v.title)}</td>
+            <td class="dim">${esc(v.channel)}</td>
+            <td class="dim">${esc(v.published || '—')}</td>
+            <td class="dim">${v.word_count ? v.word_count.toLocaleString() : '—'}</td>
+            <td><a href="${esc(v.url)}" target="_blank" rel="noopener" title="Open on YouTube">↗</a></td>
+          </tr>`).join('');
+      });
+  }
+
+  // ── Status bar ───────────────────────────────────────────────────
+
+  function loadStatus() {
+    fetch('/api/status')
+      .then(r => r.json())
+      .then(s => {
+        setDot('db',    s.database     === 'configured', s.database);
+        setDot('blob',  s.blob_storage === 'mounted',    s.blob_storage);
+        setDot('clean', s.clean_storage === 'available', s.clean_storage);
+      });
+  }
+
+  function setDot(name, ok, label) {
+    document.getElementById('dot-' + name).className = 'dot ' + (ok ? 'ok' : 'warn');
+    document.getElementById('lbl-' + name).textContent =
+      {db: 'DB', blob: 'Blob', clean: 'Storage'}[name] + ': ' + label;
+  }
+
+  // ── Init ─────────────────────────────────────────────────────────
+  loadStatus();
+  loadVideos();
+</script>
+</body>
+</html>
