@@ -80,6 +80,71 @@ def to_clean_markdown(metadata: dict, cleaned_text: str) -> str:
     return "\n".join(lines)
 
 
+def to_knowledge_doc(metadata: dict, cleaned_text: str, enrichment: dict | None) -> str:
+    """
+    Rich knowledge document: enriched YAML frontmatter + structured body
+    (summary, key concepts, section breakdown) followed by the clean transcript.
+
+    Falls back to a plain clean .md when `enrichment` is None (LLM unavailable).
+    """
+    if enrichment is None:
+        return to_clean_markdown(metadata, cleaned_text)
+
+    title = metadata.get("title", "")
+    channel = metadata.get("channel", "")
+    published = metadata.get("published", "")
+    url = metadata.get("url", "")
+    description = (metadata.get("description") or "").strip()
+    desc_yaml = _yaml_block_scalar(description) if description else '""'
+
+    summary = (enrichment.get("summary") or "").strip()
+    key_concepts = enrichment.get("key_concepts") or []
+    domains = enrichment.get("domains") or []
+    difficulty = enrichment.get("difficulty") or ""
+    content_kind = enrichment.get("content_kind") or ""
+    sections = enrichment.get("sections") or []
+    summary_yaml = _yaml_block_scalar(summary) if summary else '""'
+
+    lines = [
+        "---",
+        f'title: "{_escape_yaml(title)}"',
+        f'channel: "{_escape_yaml(channel)}"',
+        f'published: "{published}"',
+        f'url: "{url}"',
+        f'difficulty: "{difficulty}"',
+        f'content_kind: "{content_kind}"',
+        f"domains: {_yaml_flow_list(domains)}",
+        f"key_concepts: {_yaml_flow_list(key_concepts)}",
+        f"summary: {summary_yaml}",
+        f"description: {desc_yaml}",
+        "---",
+        "",
+    ]
+
+    if summary:
+        lines += ["## Summary", "", summary, ""]
+
+    if key_concepts:
+        lines += ["## Key Concepts", ""]
+        lines += [f"- {c}" for c in key_concepts]
+        lines.append("")
+
+    if sections:
+        lines += ["## Sections", ""]
+        for s in sections:
+            heading = (s.get("heading") or "").strip()
+            s_summary = (s.get("summary") or "").strip()
+            if not heading:
+                continue
+            lines.append(f"### {heading}")
+            if s_summary:
+                lines += ["", s_summary]
+            lines.append("")
+
+    lines += ["## Transcript", "", cleaned_text, ""]
+    return "\n".join(lines)
+
+
 def to_json(segments: list[dict]) -> str:
     return json.dumps(segments, ensure_ascii=False, indent=2)
 
@@ -115,3 +180,11 @@ def _escape_yaml(s: str) -> str:
 def _yaml_block_scalar(s: str) -> str:
     indented = "\n".join(f"  {line}" for line in s.splitlines())
     return f"|\n{indented}"
+
+
+def _yaml_flow_list(items: list[str]) -> str:
+    """Render a list as a YAML flow sequence, e.g. ["ml", "python"]."""
+    if not items:
+        return "[]"
+    quoted = ", ".join(f'"{_escape_yaml(str(i))}"' for i in items)
+    return f"[{quoted}]"
