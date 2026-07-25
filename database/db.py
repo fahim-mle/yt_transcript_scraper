@@ -28,6 +28,8 @@ UPDATABLE_FIELDS = frozenset({
     "title", "description", "word_count",
     "status", "clean_path",
     "topic", "tags", "notes",
+    # Content metadata derived by LLM enrichment during `clean`
+    "summary", "key_concepts", "domains", "difficulty", "content_kind",
 })
 
 
@@ -134,6 +136,61 @@ def update_video(video_id: str, updates: dict) -> None:
                     _to_audit_str(old_val),
                     _to_audit_str(new_val),
                 ))
+
+
+def upsert_sections(video_id: str, sections: list[dict]) -> None:
+    """
+    Replace the section breakdown for a video. Sections are derived (reproducible)
+    so re-running enrichment overwrites by (video_id, idx) rather than appending.
+    Each section dict: {heading, summary, start_ts?, end_ts?}.
+    """
+    if not sections:
+        return
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            for idx, s in enumerate(sections):
+                cur.execute("""
+                    INSERT INTO sections (video_id, idx, heading, summary, start_ts, end_ts)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (video_id, idx) DO UPDATE SET
+                        heading  = EXCLUDED.heading,
+                        summary  = EXCLUDED.summary,
+                        start_ts = EXCLUDED.start_ts,
+                        end_ts   = EXCLUDED.end_ts
+                """, (
+                    video_id, idx,
+                    s.get("heading", ""),
+                    s.get("summary"),
+                    s.get("start_ts"),
+                    s.get("end_ts"),
+                ))
+
+
+def record_processing_run(
+    video_id: str,
+    model: str,
+    status: str,
+    error: str | None = None,
+    duration_ms: int | None = None,
+) -> None:
+    """Append one enrichment attempt to processing_runs (audit / debugging)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO processing_runs (video_id, model, status, error, duration_ms)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (video_id, model, status, error, duration_ms))
+
+
+def get_sections(video_id: str) -> list[dict]:
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT idx, heading, summary, start_ts, end_ts "
+                "FROM sections WHERE video_id = %s ORDER BY idx",
+                (video_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
 
 
 def get_video(video_id: str) -> dict | None:

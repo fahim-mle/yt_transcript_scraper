@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS videos (
 );
 
 -- ─────────────────────────────────────────────
+-- Content metadata — derived from the transcript by the LLM enrichment
+-- step during `clean`. Added via ALTER so setup-db stays idempotent and
+-- upgrades an existing table in place.
+-- ─────────────────────────────────────────────
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS summary       TEXT;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS key_concepts  TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS domains       TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS difficulty    TEXT;   -- beginner | intermediate | advanced
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS content_kind  TEXT;   -- tutorial | lecture | talk | interview | explainer | ...
+
+-- ─────────────────────────────────────────────
 -- Audit log — append-only, no deletes
 -- Every change to an updatable field is recorded here.
 -- ─────────────────────────────────────────────
@@ -52,6 +63,39 @@ CREATE TABLE IF NOT EXISTS video_audit_log (
     new_value   TEXT,
     changed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ─────────────────────────────────────────────
+-- Sections — per-video structural breakdown produced by enrichment.
+-- Upserted by (video_id, idx); timestamps populated from YouTube chapters
+-- when available, otherwise NULL.
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS sections (
+    id          BIGSERIAL PRIMARY KEY,
+    video_id    TEXT NOT NULL REFERENCES videos(video_id),
+    idx         INTEGER NOT NULL,          -- 0-based order within the video
+    heading     TEXT NOT NULL,
+    summary     TEXT,
+    start_ts    NUMERIC,                   -- seconds, from chapter marker if known
+    end_ts      NUMERIC,
+    UNIQUE (video_id, idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sections_video ON sections(video_id);
+
+-- ─────────────────────────────────────────────
+-- Processing runs — one row per LLM enrichment attempt (audit + debugging).
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS processing_runs (
+    id          BIGSERIAL PRIMARY KEY,
+    video_id    TEXT NOT NULL REFERENCES videos(video_id),
+    model       TEXT NOT NULL,
+    status      TEXT NOT NULL,             -- success | failed
+    error       TEXT,
+    duration_ms INTEGER,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_video ON processing_runs(video_id);
 
 -- ─────────────────────────────────────────────
 -- Indexes — optimised for the expected query patterns
