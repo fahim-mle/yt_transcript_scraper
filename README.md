@@ -61,6 +61,7 @@ ollama pull qwen3:4b
 python main.py scrape "https://www.youtube.com/@ChannelHandle"
 python main.py clean       # fast, no LLM — queues videos for enrichment
 ./enrich.sh                # background LLM enrichment (low priority, resumable)
+./benchmark.sh --models qwen3:4b,qwen2.5:3b-instruct   # optional: compare models
 python main.py ingest
 
 # Or launch the web UI
@@ -87,6 +88,22 @@ Run it overnight via cron:
 ```
 
 To skip enrichment entirely (e.g. until you've picked a model), set `LLM_ENABLED=0` in `.env` — the rest of the pipeline is unaffected.
+
+### Choosing a model
+
+Swapping the enrichment model is a one-line change — `ollama pull <model>`, then set `OLLAMA_MODEL=<model>` in `.env`. No code changes. To decide *which* model, benchmark candidates on one of your own transcripts:
+
+```bash
+./benchmark.sh --models qwen3:4b,qwen2.5:7b-instruct,qwen2.5:3b-instruct
+```
+
+This runs the **same** transcript through each model via the real enrichment path and prints a side-by-side table (generation tok/s, wall time, concept/section counts) followed by each model's actual summary, key concepts, domains and section headings — so you compare speed *and* quality, not just speed. It's read-only (nothing is written to the DB or blob storage). Useful flags:
+
+- `--video <video_id>` — benchmark a specific video (default: first in `dataset.jsonl`)
+- `--words N` — cap input words for a fair, bounded comparison (default from `LLM_MAX_INPUT_WORDS`)
+- `--out results.json` — save the full output for later reference
+
+Model choice is VRAM-bound: a model must fit alongside its KV cache in your GPU or layers spill to CPU (much slower). On a 4 GB card, a 3–4B model at Q4 fits fully; a 7–8B model runs partly on CPU. Benchmark before committing.
 
 ### Database connection
 

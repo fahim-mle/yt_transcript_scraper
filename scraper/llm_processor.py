@@ -104,6 +104,20 @@ def _cap_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words])
 
 
+# Per-run performance counters, populated by _call_ollama from Ollama's own
+# timing fields. Used by the benchmark command to report real tokens/sec.
+# A caller resets before a run and reads after; harmless in normal use.
+_call_stats: list[dict] = []
+
+
+def reset_call_stats() -> None:
+    _call_stats.clear()
+
+
+def get_call_stats() -> list[dict]:
+    return list(_call_stats)
+
+
 def _call_ollama(prompt: str, schema: dict) -> dict | None:
     """POST to Ollama /api/chat constrained to `schema`; returns parsed dict or None."""
     payload = {
@@ -135,6 +149,15 @@ def _call_ollama(prompt: str, schema: dict) -> dict | None:
     except (TimeoutError, json.JSONDecodeError) as exc:
         logger.warning("Ollama response problem: %s", exc)
         return None
+
+    # Capture Ollama's own timing counters (durations are nanoseconds).
+    _call_stats.append({
+        "eval_count":           body.get("eval_count", 0),
+        "eval_duration":        body.get("eval_duration", 0),
+        "prompt_eval_count":    body.get("prompt_eval_count", 0),
+        "prompt_eval_duration": body.get("prompt_eval_duration", 0),
+        "load_duration":        body.get("load_duration", 0),
+    })
 
     content = (body.get("message") or {}).get("content", "")
     if not content:

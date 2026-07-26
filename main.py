@@ -402,6 +402,124 @@ def cmd_enrich(args: argparse.Namespace) -> None:
     logger.info("Enrich worker done. %d processed.", processed)
 
 
+# ── benchmark ─────────────────────────────────────────────────────────────
+
+def _tokens_per_sec(stats: list[dict]) -> float | None:
+    """Generation throughput across all Ollama calls in one enrich run."""
+    tokens = sum(s.get("eval_count", 0) for s in stats)
+    nanos = sum(s.get("eval_duration", 0) for s in stats)
+    if tokens <= 0 or nanos <= 0:
+        return None
+    return tokens / (nanos / 1e9)
+
+
+def cmd_benchmark(args: argparse.Namespace) -> None:
+    """
+    Run the SAME transcript through several models and compare speed + output
+    side by side, so you can pick a model empirically. Uses the real enrichment
+    path (schema-constrained JSON + key_concepts fallback), so what you see is
+    exactly what the pipeline would store.
+
+    Nothing is written to the DB or blob storage — this is read-only measurement.
+    """
+    if not llm_processor.is_available():
+        logger.error("Ollama unreachable at %s — start it (`ollama serve`) and retry.",
+                     config.OLLAMA_HOST)
+        return
+
+    models = ([m.strip() for m in args.models.split(",") if m.strip()]
+              if args.models else [config.OLLAMA_MODEL])
+
+    index = _load_records_index(args.raw_dir)
+    if not index:
+        logger.error("No dataset.jsonl records in %s — scrape something first.", args.raw_dir)
+        return
+
+    if args.video:
+        rec = index.get(args.video)
+        if rec is None:
+            logger.error("video_id %s not found in %s/dataset.jsonl.", args.video, args.raw_dir)
+            return
+    else:
+        rec = next(iter(index.values()))
+
+    meta = _meta_from_record(rec)
+    chapters = rec.get("chapters") or []
+    cleaned_text = cleaner.clean(rec.get("transcript_segments", []), chapters=chapters)
+    if cleaned_text is None:
+        logger.error("Couldn't clean %s — no prose to benchmark.", meta["video_id"])
+        return
+
+    words = cleaned_text.split()
+    if args.words and len(words) > args.words:
+        cleaned_text = " ".join(words[:args.words])
+    input_words = len(cleaned_text.split())
+
+    print(f"\nBenchmark input: {meta['title']!r} ({meta['video_id']}) — "
+          f"{input_words} words fed to each model")
+    print(f"Models: {', '.join(models)}\n")
+
+    original_model = config.OLLAMA_MODEL
+    rows = []
+    try:
+        for model in models:
+            config.OLLAMA_MODEL = model
+            logger.info("Benchmarking %s …", model)
+            llm_processor.reset_call_stats()
+            result = llm_processor.enrich(meta["title"], cleaned_text, chapters)
+            tps = _tokens_per_sec(llm_processor.get_call_stats())
+            e = result.enrichment
+            rows.append({
+                "model": model,
+                "ok": result.ok,
+                "wall_s": result.duration_ms / 1000,
+                "tps": tps,
+                "concepts": len(e.key_concepts) if e else 0,
+                "sections": len(e.sections) if e else 0,
+                "difficulty": e.difficulty if e else "-",
+                "content_kind": e.content_kind if e else "-",
+                "error": result.error,
+                "enrichment": e,
+            })
+    finally:
+        config.OLLAMA_MODEL = original_model
+
+    # Summary table
+    print(f"\n{'model':<26}{'ok':<5}{'wall(s)':<10}{'gen tok/s':<12}"
+          f"{'concepts':<10}{'sections':<10}difficulty/kind")
+    print("-" * 92)
+    for r in rows:
+        tps = f"{r['tps']:.1f}" if r["tps"] is not None else "n/a"
+        print(f"{r['model']:<26}{('yes' if r['ok'] else 'NO'):<5}"
+              f"{r['wall_s']:<10.1f}{tps:<12}{r['concepts']:<10}{r['sections']:<10}"
+              f"{r['difficulty']}/{r['content_kind']}")
+
+    # Per-model output so you can judge quality, not just speed
+    for r in rows:
+        print(f"\n─── {r['model']} ───")
+        if not r["ok"]:
+            print(f"  FAILED: {r['error']}")
+            continue
+        e = r["enrichment"]
+        print(f"  summary:      {e.summary}")
+        print(f"  key_concepts: {e.key_concepts}")
+        print(f"  domains:      {e.domains}")
+        print(f"  sections:     " + " | ".join(s.heading for s in e.sections))
+
+    if args.out:
+        payload = {
+            "video_id": meta["video_id"],
+            "title": meta["title"],
+            "input_words": input_words,
+            "results": [{k: v for k, v in r.items() if k != "enrichment"}
+                        | {"enrichment": r["enrichment"].model_dump() if r["enrichment"] else None}
+                        for r in rows],
+        }
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        print(f"\nSaved results to {args.out}")
+
+
 # ── ingest ────────────────────────────────────────────────────────────────
 
 _VIDEO_ID_RE = re.compile(r'url:\s+"https://www\.youtube\.com/watch\?v=([^"]+)"')
@@ -572,6 +690,15 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--loop",  action="store_true", help="Keep polling for new work instead of exiting")
     ep.add_argument("--poll",  type=int, default=60, help="Seconds between polls in --loop mode")
 
+    # benchmark
+    bp = sub.add_parser("benchmark", help="Compare models on the same transcript (speed + output)")
+    bp.add_argument("--models", help="Comma-separated Ollama model tags (default: OLLAMA_MODEL)")
+    bp.add_argument("--video", help="video_id to test (default: first in dataset.jsonl)")
+    bp.add_argument("--raw-dir", default=config.LOCAL_OUTPUT_DIR)
+    bp.add_argument("--words", type=int, default=config.LLM_MAX_INPUT_WORDS,
+                    help="Cap input words for a fair, bounded comparison (0 = no cap)")
+    bp.add_argument("--out", help="Optional path to save full results as JSON")
+
     # ingest
     ip = sub.add_parser("ingest", help="Copy approved files from blob storage → /srv/dbdata")
     ip.add_argument("--blob-dir",  default=config.BLOB_OUTPUT_DIR)
@@ -589,6 +716,7 @@ def main() -> None:
         "scrape":    cmd_scrape,
         "clean":     cmd_clean,
         "enrich":    cmd_enrich,
+        "benchmark": cmd_benchmark,
         "ingest":    cmd_ingest,
         "setup-db":  cmd_setup_db,
     }[args.command](args)
