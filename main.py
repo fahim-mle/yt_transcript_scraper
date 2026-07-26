@@ -156,7 +156,19 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     logger.info("Done. %d saved, %d skipped, %d failed.", success, skipped, failed)
 
 
-# ── clean ─────────────────────────────────────────────────────────────────
+# ── shared helpers for clean / enrich ─────────────────────────────────────
+
+def _meta_from_record(rec: dict) -> dict:
+    return {k: rec.get(k, "") for k in
+            ("video_id", "url", "title", "channel", "published", "description")}
+
+
+def _blob_path_for(blob_dir: str, meta: dict) -> tuple[str, str]:
+    channel_dir = os.path.join(
+        blob_dir, formatter.sanitize_filename(meta["channel"] or "unknown_channel"))
+    stem = formatter.sanitize_filename(meta["title"] or meta["video_id"])
+    return channel_dir, os.path.join(channel_dir, f"{stem}.md")
+
 
 def _sections_with_timestamps(sections: list[dict], chapters: list[dict]) -> list[dict]:
     """
@@ -174,58 +186,29 @@ def _sections_with_timestamps(sections: list[dict], chapters: list[dict]) -> lis
     return out
 
 
-def _persist_clean(meta: dict, cleaned_text: str, enrichment: dict | None,
-                   chapters: list[dict], result) -> None:
-    """Write clean-stage results to PostgreSQL: video row, sections, run log."""
-    video_id = meta["video_id"]
+# ── clean ─────────────────────────────────────────────────────────────────
 
-    # scrape may have run before DB was configured — make sure the row exists.
+def _persist_clean_row(meta: dict, cleaned_text: str) -> None:
+    """Ensure the video row exists, mark it cleaned and pending enrichment."""
+    video_id = meta["video_id"]
+    wc = len(cleaned_text.split())
     try:
         if db.get_video(video_id) is None:
-            db.upsert_video({**meta, "word_count": len(cleaned_text.split()), "status": "raw"})
-    except Exception as exc:
-        logger.warning("DB upsert failed for %s: %s", video_id, exc)
-        return
-
-    updates = {"status": "cleaned", "word_count": len(cleaned_text.split())}
-    if enrichment:
-        updates.update({
-            "summary":      enrichment.get("summary"),
-            "key_concepts": enrichment.get("key_concepts") or [],
-            "domains":      enrichment.get("domains") or [],
-            "difficulty":   enrichment.get("difficulty"),
-            "content_kind": enrichment.get("content_kind"),
-        })
-    try:
-        db.update_video(video_id, updates)
+            db.upsert_video({**meta, "word_count": wc, "status": "raw"})
+        db.update_video(video_id, {"status": "cleaned", "word_count": wc})
+        db.set_enrichment_status(video_id, "pending")
     except Exception as exc:
         logger.warning("DB update failed for %s: %s", video_id, exc)
-
-    if enrichment:
-        try:
-            db.upsert_sections(
-                video_id,
-                _sections_with_timestamps(enrichment.get("sections") or [], chapters),
-            )
-        except Exception as exc:
-            logger.warning("Section upsert failed for %s: %s", video_id, exc)
-
-    if result is not None:
-        try:
-            db.record_processing_run(
-                video_id, result.model,
-                "success" if result.ok else "failed",
-                result.error, result.duration_ms,
-            )
-        except Exception as exc:
-            logger.warning("Run log failed for %s: %s", video_id, exc)
 
 
 def cmd_clean(args: argparse.Namespace) -> None:
     """
-    Reads raw records from dataset.jsonl, applies the cleaning pipeline,
-    and writes reviewed .md files to blob storage for human inspection.
-    Does NOT touch /srv/dbdata — use 'ingest' for that.
+    Reads raw records from dataset.jsonl, applies the deterministic cleaning
+    pipeline, and writes structured .md files to blob storage for review.
+
+    This stage is fast and does NOT call the LLM — enrichment is a separate,
+    resumable background job ('enrich'). Cleaned videos are queued for it by
+    setting enrichment_status = 'pending'.
     """
     raw_dir  = args.raw_dir
     blob_dir = args.blob_dir
@@ -241,27 +224,14 @@ def cmd_clean(args: argparse.Namespace) -> None:
     logger.info("Reading from %s", jsonl_path)
     logger.info("Cleaned output → %s  (blob storage for review)", blob_dir)
 
-    # Decide once whether LLM enrichment can run this session.
-    llm_ready = config.LLM_ENABLED and llm_processor.is_available()
-    if config.LLM_ENABLED and not llm_ready:
-        logger.warning("LLM enrichment on but Ollama unreachable — writing plain clean .md.")
-    elif not config.LLM_ENABLED:
-        logger.info("LLM enrichment disabled (LLM_ENABLED=0).")
-    else:
-        logger.info("LLM enrichment on — model: %s", config.OLLAMA_MODEL)
-
     with open(jsonl_path, encoding="utf-8") as f:
         records = [json.loads(line) for line in f if line.strip()]
 
-    saved, skipped, filtered, enriched = 0, 0, 0, 0
+    saved, skipped, filtered = 0, 0, 0
     for rec in records:
-        meta = {k: rec.get(k, "") for k in
-                ("video_id", "url", "title", "channel", "published", "description")}
+        meta = _meta_from_record(rec)
         chapters = rec.get("chapters") or []
-
-        channel_dir = os.path.join(blob_dir, formatter.sanitize_filename(meta["channel"] or "unknown_channel"))
-        stem = formatter.sanitize_filename(meta["title"] or meta["video_id"])
-        blob_path = os.path.join(channel_dir, f"{stem}.md")
+        channel_dir, blob_path = _blob_path_for(blob_dir, meta)
 
         if os.path.exists(blob_path):
             skipped += 1
@@ -279,29 +249,157 @@ def cmd_clean(args: argparse.Namespace) -> None:
             filtered += 1
             continue
 
-        # LLM enrichment — optional, degrades gracefully to a plain clean .md
-        enrichment, result = None, None
-        if llm_ready:
-            result = llm_processor.enrich(meta["title"], cleaned_text, chapters)
-            if result.ok:
-                enrichment = result.enrichment.model_dump()
-                enriched += 1
-
         os.makedirs(channel_dir, exist_ok=True)
         with open(blob_path, "w", encoding="utf-8") as f:
-            f.write(formatter.to_knowledge_doc(meta, cleaned_text, enrichment))
-        logger.info("Cleaned → %s%s", blob_path, "  (enriched)" if enrichment else "")
+            f.write(formatter.to_clean_markdown(meta, cleaned_text))
+        logger.info("Cleaned → %s", blob_path)
         saved += 1
 
         if _db_available():
-            _persist_clean(meta, cleaned_text, enrichment, chapters, result)
+            _persist_clean_row(meta, cleaned_text)
 
     logger.info(
-        "Clean done. %d written to blob (%d enriched), %d already existed, %d filtered.",
-        saved, enriched, skipped, filtered,
+        "Clean done. %d written to blob, %d already existed, %d filtered.",
+        saved, skipped, filtered,
     )
-    if saved:
-        logger.info("Review files in %s, then run 'ingest' to push approved ones to /srv/dbdata.", blob_dir)
+    if saved and _db_available():
+        logger.info("Queued %d for enrichment. Run './enrich.sh' (or 'python main.py enrich').", saved)
+
+
+# ── enrich (background worker) ─────────────────────────────────────────────
+
+def _load_records_index(raw_dir: str) -> dict:
+    """Map video_id → dataset.jsonl record, for fast lookup by the worker."""
+    jsonl_path = os.path.join(raw_dir, "dataset.jsonl")
+    index: dict = {}
+    if os.path.exists(jsonl_path):
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rec = json.loads(line)
+                    if rec.get("video_id"):
+                        index[rec["video_id"]] = rec
+    return index
+
+
+def _enrich_one(video_id: str, rec: dict, blob_dir: str) -> str:
+    """
+    Enrich a single video end-to-end: LLM → DB (content, sections, run log) →
+    rewrite the blob .md as a knowledge doc. Returns an outcome string.
+    """
+    meta = _meta_from_record(rec)
+    chapters = rec.get("chapters") or []
+    cleaned_text = cleaner.clean(rec.get("transcript_segments", []), chapters=chapters)
+    if cleaned_text is None:
+        db.set_enrichment_status(video_id, "done")  # nothing to enrich
+        return "no-prose"
+
+    result = llm_processor.enrich(meta["title"], cleaned_text, chapters)
+
+    try:
+        db.record_processing_run(
+            video_id, result.model,
+            "success" if result.ok else "failed",
+            result.error, result.duration_ms,
+        )
+    except Exception as exc:
+        logger.warning("Run log failed for %s: %s", video_id, exc)
+
+    if not result.ok:
+        db.set_enrichment_status(video_id, "failed")
+        return "failed"
+
+    enrichment = result.enrichment.model_dump()
+    try:
+        db.update_video(video_id, {
+            "summary":      enrichment.get("summary"),
+            "key_concepts": enrichment.get("key_concepts") or [],
+            "domains":      enrichment.get("domains") or [],
+            "difficulty":   enrichment.get("difficulty"),
+            "content_kind": enrichment.get("content_kind"),
+        })
+        db.upsert_sections(
+            video_id,
+            _sections_with_timestamps(enrichment.get("sections") or [], chapters),
+        )
+    except Exception as exc:
+        logger.warning("DB write failed for %s: %s", video_id, exc)
+
+    # Rewrite the review .md with the enriched frontmatter + structure.
+    channel_dir, blob_path = _blob_path_for(blob_dir, meta)
+    try:
+        os.makedirs(channel_dir, exist_ok=True)
+        with open(blob_path, "w", encoding="utf-8") as f:
+            f.write(formatter.to_knowledge_doc(meta, cleaned_text, enrichment))
+    except Exception as exc:
+        logger.warning("Blob rewrite failed for %s: %s", video_id, exc)
+
+    db.set_enrichment_status(video_id, "done")
+    return "done"
+
+
+def cmd_enrich(args: argparse.Namespace) -> None:
+    """
+    Drain the enrichment queue (cleaned videos with enrichment_status pending
+    or failed), oldest first. Idempotent and resumable: each video is marked
+    'done' when finished, so re-runs never reprocess it. Interrupt any time;
+    the next run picks up where it left off.
+
+    Default: process everything pending, then exit (ideal for cron).
+    --loop:  keep polling for new work forever (a low-priority background svc).
+    """
+    if not _db_available():
+        logger.error("enrich needs DATABASE_URL — it reads the queue from PostgreSQL.")
+        return
+    if not config.LLM_ENABLED:
+        logger.error("LLM_ENABLED=0 — nothing to do. Set it to 1 in .env to enrich.")
+        return
+    if not llm_processor.is_available():
+        logger.error("Ollama unreachable at %s — start it (`ollama serve`) and retry.",
+                     config.OLLAMA_HOST)
+        return
+
+    logger.info("Enrich worker — model: %s%s", config.OLLAMA_MODEL,
+                "  (loop mode)" if args.loop else "")
+    processed = 0
+    while True:
+        index = _load_records_index(args.raw_dir)
+        pending = db.list_pending_enrichment(limit=args.limit or None)
+
+        if not pending:
+            if args.loop:
+                logger.info("Queue empty — sleeping %ds.", args.poll)
+                time.sleep(args.poll)
+                continue
+            break
+
+        for video_id in pending:
+            rec = index.get(video_id)
+            if rec is None:
+                logger.warning("No dataset.jsonl record for %s — marking failed.", video_id)
+                db.set_enrichment_status(video_id, "failed")
+                continue
+            logger.info("Enriching %s — %s", video_id, rec.get("title", ""))
+            try:
+                outcome = _enrich_one(video_id, rec, args.blob_dir)
+            except Exception as exc:
+                logger.error("Enrichment crashed for %s: %s", video_id, exc)
+                try:
+                    db.set_enrichment_status(video_id, "failed")
+                except Exception:
+                    pass
+                outcome = "error"
+            logger.info("  → %s", outcome)
+            processed += 1
+            if args.limit and processed >= args.limit:
+                logger.info("Reached --limit %d.", args.limit)
+                logger.info("Enrich worker done. %d processed.", processed)
+                return
+
+        if not args.loop:
+            break
+
+    logger.info("Enrich worker done. %d processed.", processed)
 
 
 # ── ingest ────────────────────────────────────────────────────────────────
@@ -466,6 +564,14 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--raw-dir",  default=config.LOCAL_OUTPUT_DIR)
     cp.add_argument("--blob-dir", default=config.BLOB_OUTPUT_DIR)
 
+    # enrich
+    ep = sub.add_parser("enrich", help="Background LLM enrichment of cleaned videos (resumable)")
+    ep.add_argument("--raw-dir",  default=config.LOCAL_OUTPUT_DIR)
+    ep.add_argument("--blob-dir", default=config.BLOB_OUTPUT_DIR)
+    ep.add_argument("--limit", type=int, default=0, help="Max videos to enrich this run (0 = all pending)")
+    ep.add_argument("--loop",  action="store_true", help="Keep polling for new work instead of exiting")
+    ep.add_argument("--poll",  type=int, default=60, help="Seconds between polls in --loop mode")
+
     # ingest
     ip = sub.add_parser("ingest", help="Copy approved files from blob storage → /srv/dbdata")
     ip.add_argument("--blob-dir",  default=config.BLOB_OUTPUT_DIR)
@@ -482,6 +588,7 @@ def main() -> None:
     {
         "scrape":    cmd_scrape,
         "clean":     cmd_clean,
+        "enrich":    cmd_enrich,
         "ingest":    cmd_ingest,
         "setup-db":  cmd_setup_db,
     }[args.command](args)

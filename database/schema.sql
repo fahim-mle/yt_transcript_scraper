@@ -51,6 +51,14 @@ ALTER TABLE videos ADD COLUMN IF NOT EXISTS domains       TEXT[] NOT NULL DEFAUL
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS difficulty    TEXT;   -- beginner | intermediate | advanced
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS content_kind  TEXT;   -- tutorial | lecture | talk | interview | explainer | ...
 
+-- Enrichment queue state — drives the background `enrich` worker (FIFO).
+--   pending → cleaned, awaiting LLM enrichment
+--   done    → enriched successfully, never reprocessed
+--   failed  → enrichment attempted and failed (eligible for retry)
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS enrichment_status TEXT NOT NULL DEFAULT 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_videos_enrichment ON videos(enrichment_status);
+
 -- ─────────────────────────────────────────────
 -- Audit log — append-only, no deletes
 -- Every change to an updatable field is recorded here.

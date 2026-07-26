@@ -182,6 +182,40 @@ def record_processing_run(
             """, (video_id, model, status, error, duration_ms))
 
 
+def list_pending_enrichment(limit: int | None = None) -> list[str]:
+    """
+    Return video_ids that are cleaned but not yet enriched, oldest first (FIFO).
+    'failed' rows are included so a later run can retry them.
+    """
+    sql = (
+        "SELECT video_id FROM videos "
+        "WHERE status IN ('cleaned', 'ingested') "
+        "AND enrichment_status IN ('pending', 'failed') "
+        "ORDER BY created_at ASC"
+    )
+    params: list = []
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [r[0] for r in cur.fetchall()]
+
+
+def set_enrichment_status(video_id: str, status: str) -> None:
+    """
+    Set the enrichment queue state (pending | done | failed). This is transient
+    operational state, so it's a plain UPDATE — not written to the audit log.
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE videos SET enrichment_status = %s WHERE video_id = %s",
+                (status, video_id),
+            )
+
+
 def get_sections(video_id: str) -> list[dict]:
     with _conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
