@@ -33,8 +33,19 @@ class Section(BaseModel):
 
 class Enrichment(BaseModel):
     summary: str = Field(..., description="2-4 sentence overview of the whole video")
-    key_concepts: list[str] = Field(default_factory=list, description="3-8 core concepts or terms")
-    domains: list[str] = Field(default_factory=list, description="1-4 subject areas, e.g. 'machine learning'")
+    # json_schema_extra nudges Ollama's grammar toward 3-8 items without making
+    # validation hard-fail if the model still returns fewer (we'd rather keep a
+    # good summary than discard the whole result over one field).
+    key_concepts: list[str] = Field(
+        default_factory=list,
+        description="REQUIRED. 3-8 specific technical terms or named concepts from the video. Never empty.",
+        json_schema_extra={"minItems": 3, "maxItems": 8},
+    )
+    domains: list[str] = Field(
+        default_factory=list,
+        description="1-4 subject areas, e.g. 'machine learning'",
+        json_schema_extra={"minItems": 1, "maxItems": 4},
+    )
     difficulty: str = Field(..., description="beginner, intermediate, or advanced")
     content_kind: str = Field(..., description="tutorial, lecture, talk, interview, explainer, news, or other")
     sections: list[Section] = Field(default_factory=list, description="Ordered logical sections of the video")
@@ -70,10 +81,15 @@ def _build_prompt(title: str, cleaned_text: str, chapter_titles: list[str]) -> s
         cleaned_text,
         '"""',
         "",
-        "Produce: a concise overall summary; 3-8 key concepts; 1-4 domains; "
-        "a difficulty (beginner/intermediate/advanced); a content_kind "
-        "(tutorial/lecture/talk/interview/explainer/news/other); and an ordered list "
-        "of sections, each with a heading and a 1-2 sentence summary.",
+        "Produce ALL of the following fields:",
+        "- summary: a concise overall summary.",
+        "- key_concepts: 3 to 8 specific technical terms or named concepts actually "
+        "discussed (e.g. 'gradient descent', 'activation function'). This is required — "
+        "never return an empty list; always extract at least 3.",
+        "- domains: 1 to 4 subject areas (e.g. 'machine learning').",
+        "- difficulty: beginner, intermediate, or advanced.",
+        "- content_kind: tutorial, lecture, talk, interview, explainer, news, or other.",
+        "- sections: an ordered list, each with a heading and a 1-2 sentence summary.",
     ]
     return "\n".join(parts)
 
@@ -88,8 +104,8 @@ def _cap_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words])
 
 
-def _call_ollama(prompt: str) -> dict | None:
-    """POST to Ollama /api/chat with a JSON schema; returns parsed dict or None."""
+def _call_ollama(prompt: str, schema: dict) -> dict | None:
+    """POST to Ollama /api/chat constrained to `schema`; returns parsed dict or None."""
     payload = {
         "model": config.OLLAMA_MODEL,
         "messages": [
@@ -97,7 +113,7 @@ def _call_ollama(prompt: str) -> dict | None:
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "format": Enrichment.model_json_schema(),
+        "format": schema,
         # This is structured extraction, not reasoning — disable qwen3's
         # "thinking" mode so it emits the JSON directly instead of pages of
         # chain-of-thought. Ignored by models that don't support it.
@@ -142,6 +158,35 @@ def _normalise(e: Enrichment) -> Enrichment:
     return e
 
 
+class _Concepts(BaseModel):
+    concepts: list[str]
+
+
+def _extract_concepts(enrichment: Enrichment) -> list[str]:
+    """
+    Fallback for the empty-key_concepts case: Ollama's grammar doesn't enforce
+    array minItems, so the model sometimes returns []. Here we make one small,
+    fast follow-up call over the already-generated summary + section notes to
+    pull out concrete concepts. Cheap even on CPU (short input and output).
+    """
+    notes = enrichment.summary + "\n" + "\n".join(
+        f"{s.heading}: {s.summary}" for s in enrichment.sections
+    )
+    prompt = (
+        "From the following video summary and section notes, list 3 to 8 specific "
+        "technical terms or named concepts (short noun phrases, e.g. "
+        "'gradient descent'). Return them as the 'concepts' array.\n\n" + notes
+    )
+    raw = _call_ollama(prompt, _Concepts.model_json_schema())
+    if not raw:
+        return []
+    try:
+        concepts = _Concepts.model_validate(raw).concepts
+    except ValidationError:
+        return []
+    return [c.strip() for c in concepts if c.strip()][:8]
+
+
 # ── Public API ─────────────────────────────────────────────────────────────
 
 class Result:
@@ -166,18 +211,25 @@ def enrich(title: str, cleaned_text: str, chapters: list[dict] | None = None) ->
     chapter_titles = [c["title"].strip() for c in (chapters or []) if c.get("title")]
     prompt = _build_prompt(title, _cap_words(cleaned_text, config.LLM_MAX_INPUT_WORDS), chapter_titles)
 
-    raw = _call_ollama(prompt)
-    elapsed = int((time.monotonic() - started) * 1000)
+    raw = _call_ollama(prompt, Enrichment.model_json_schema())
 
     if raw is None:
+        elapsed = int((time.monotonic() - started) * 1000)
         return Result(None, elapsed, "ollama_unavailable_or_invalid_json")
 
     try:
         enrichment = _normalise(Enrichment.model_validate(raw))
     except ValidationError as exc:
+        elapsed = int((time.monotonic() - started) * 1000)
         logger.warning("Enrichment failed schema validation: %s", exc)
         return Result(None, elapsed, f"validation_error: {exc.error_count()} issue(s)")
 
+    # The grammar can't enforce a non-empty key_concepts, so recover it here.
+    if not enrichment.key_concepts:
+        logger.info("key_concepts empty — running targeted concept extraction.")
+        enrichment.key_concepts = _extract_concepts(enrichment)
+
+    elapsed = int((time.monotonic() - started) * 1000)
     logger.info(
         "Enriched in %d ms — %d concepts, %d sections.",
         elapsed, len(enrichment.key_concepts), len(enrichment.sections),
