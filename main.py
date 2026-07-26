@@ -23,6 +23,7 @@ Examples:
 
 import argparse
 import csv
+import datetime as dt
 import json
 import logging
 import os
@@ -84,18 +85,14 @@ def _db_available() -> bool:
 
 # ── scrape ────────────────────────────────────────────────────────────────
 
-def _scrape_video(meta: dict, output_dir: str, lang: str, save_json: bool) -> dict | None:
+def _scrape_video(meta: dict, output_dir: str, lang: str, save_json: bool) -> dict:
+    """Fetch and write one video. Raises transcript.TranscriptError on failure."""
     md_path, json_path = _output_paths(output_dir, meta)
-    if os.path.exists(md_path):
-        return None
 
     video_id = meta["video_id"]
     logger.info("Fetching: %s — %s", video_id, meta.get("title", ""))
 
     segments = transcript.fetch(video_id, lang=lang)
-    if segments is None:
-        logger.warning("No transcript for %s, skipping.", video_id)
-        return None
 
     os.makedirs(os.path.dirname(md_path), exist_ok=True)
 
@@ -123,21 +120,51 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     if not _db_available():
         logger.warning("DATABASE_URL not set — skipping PostgreSQL.")
 
-    records, success, skipped, failed = [], 0, 0, 0
-    for i, meta in enumerate(videos):
-        if i > 0:
-            time.sleep(args.delay)
+    # Pacing lives in the transcript module now — it throttles per request, not
+    # per video, so language fallbacks and retries are counted honestly.
+    transcript.set_delay(getattr(args, "delay", config.DELAY_BETWEEN_REQUESTS))
 
+    records, failures, success, skipped = [], [], 0, 0
+    consecutive_blocks = 0
+    aborted = False
+
+    for meta in videos:
         if os.path.exists(_output_paths(output_dir, meta)[0]):
             skipped += 1
             logger.info("Already exists, skipping: %s", meta.get("title", meta["video_id"]))
             continue
 
-        record = _scrape_video(meta, output_dir, args.lang, not args.no_json)
-        if record is None:
-            failed += 1
+        try:
+            record = _scrape_video(meta, output_dir, args.lang, not args.no_json)
+        except transcript.TranscriptError as exc:
+            failures.append({
+                "video_id": meta["video_id"],
+                "title":    meta.get("title", ""),
+                "reason":   exc.reason,
+                "detail":   exc.detail,
+                "transient": exc.transient,
+                "at":       dt.datetime.now().isoformat(timespec="seconds"),
+            })
+            logger.warning("Skipping %s — %s.", meta["video_id"], exc.reason)
+
+            # Only blocks trip the breaker. A run of videos that simply have no
+            # transcript is normal; a run of blocks means YouTube is refusing us
+            # and every further request digs the hole deeper.
+            if isinstance(exc, transcript.TranscriptBlocked):
+                consecutive_blocks += 1
+                if consecutive_blocks >= config.BLOCK_ABORT_THRESHOLD:
+                    logger.error(
+                        "Aborting: %d consecutive videos blocked. Wait before "
+                        "retrying — re-running resumes where this stopped.",
+                        consecutive_blocks,
+                    )
+                    aborted = True
+                    break
+            else:
+                consecutive_blocks = 0
             continue
 
+        consecutive_blocks = 0
         success += 1
         records.append(record)
 
@@ -153,7 +180,39 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 logger.warning("DB upsert failed for %s: %s", meta["video_id"], exc)
 
     _write_local_aggregate(records, output_dir, args.no_jsonl, args.no_csv)
-    logger.info("Done. %d saved, %d skipped, %d failed.", success, skipped, failed)
+    _report_failures(failures, output_dir)
+
+    logger.info("Done. %d saved, %d skipped, %d failed.%s",
+                success, skipped, len(failures), " RUN ABORTED." if aborted else "")
+
+
+def _report_failures(failures: list[dict], output_dir: str) -> None:
+    """
+    Summarise failures by cause and append them to scrape_failures.jsonl, so a
+    failed video is a record you can act on rather than a number in a log line.
+    Transient ones are picked up automatically on the next run (scrape skips
+    videos whose .md already exists), permanent ones never need retrying.
+    """
+    if not failures:
+        return
+
+    by_reason: dict[str, int] = {}
+    for f in failures:
+        by_reason[f["reason"]] = by_reason.get(f["reason"], 0) + 1
+    logger.warning("Failures by cause: %s",
+                   ", ".join(f"{k}={v}" for k, v in sorted(by_reason.items())))
+
+    retryable = [f for f in failures if f["transient"]]
+    if retryable:
+        logger.warning("%d video(s) failed transiently — re-run the same command "
+                       "later to pick them up.", len(retryable))
+
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "scrape_failures.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        for rec in failures:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    logger.info("Wrote %d failure record(s) to %s", len(failures), path)
 
 
 # ── shared helpers for clean / enrich ─────────────────────────────────────
