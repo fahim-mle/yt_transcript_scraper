@@ -141,6 +141,7 @@ PostgreSQL tracks every video through the pipeline:
 
 ## Documentation
 
+- [Status & operations](docs/status.md) — current state, YouTube blocking + don't-get-banned strategy, error-fix strategy, future scope
 - [Architecture](docs/architecture.md) — system design and decisions
 - [Data schema](docs/data-schema.md) — PostgreSQL tables, indexes, file formats
 - [Pipeline reference](docs/pipeline.md) — scrape / clean stages in detail
@@ -150,6 +151,9 @@ PostgreSQL tracks every video through the pipeline:
 
 - [x] LLM content enrichment (summary, concepts, domains, difficulty, sections)
 - [x] Web UI for scrape / clean / ingest with live logs
+- [x] Model benchmark command for empirical model selection
+- [ ] Harden transcript fetch — typed errors, backoff, optional proxy/cookies
+- [ ] Map-reduce enrichment for long transcripts (remove input cap)
 - [ ] `embed` command — chunk clean transcripts → Qdrant/Chroma
 - [ ] Semantic search CLI
 - [ ] Graph view of related content
