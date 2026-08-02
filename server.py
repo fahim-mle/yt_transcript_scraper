@@ -60,7 +60,7 @@ import main as pipeline
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 app = FastAPI(title="YT Transcript Scraper", docs_url=None, redoc_url=None)
 logger = logging.getLogger(__name__)
@@ -72,9 +72,6 @@ _active_lock = threading.Lock()
 _job_queues: dict[str, queue.Queue] = {}
 
 
-def _is_running() -> bool:
-    with _active_lock:
-        return _active_job is not None and _active_job["status"] == "running"
 
 
 def _launch(label: str, fn, *args) -> str | None:
@@ -91,18 +88,29 @@ def _launch(label: str, fn, *args) -> str | None:
         tid = threading.current_thread().ident
         with _tqm_lock:
             _thread_queue_map[tid] = q
+        status = "done"
         try:
             fn(*args)
-            with _active_lock:
-                _active_job["status"] = "done"
         except Exception as exc:
+            status = "error"
             logger.error("Job %s failed: %s", job_id, exc)
-            with _active_lock:
-                _active_job["status"] = "error"
         finally:
             with _tqm_lock:
                 _thread_queue_map.pop(tid, None)
-            q.put_nowait(None)  # sentinel — stream ends
+            with _active_lock:
+                if _active_job is not None and _active_job["id"] == job_id:
+                    _active_job["status"] = status
+            terminal = ("done", status)
+            try:
+                q.put_nowait(terminal)
+            except queue.Full:
+                # Preserve completion even when a verbose unattended job filled
+                # the bounded queue: sacrifice one old log line for the sentinel.
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                q.put_nowait(terminal)
 
     threading.Thread(target=run, daemon=True, name=f"job-{job_id}").start()
     return job_id
@@ -125,8 +133,6 @@ def api_scrape(body: ScrapeBody):
     url = body.url.strip()
     if not url:
         return JSONResponse({"error": "url required"}, status_code=400)
-    if _is_running():
-        return JSONResponse({"error": "A job is already running"}, status_code=409)
 
     def run():
         ns = argparse.Namespace(
@@ -136,41 +142,189 @@ def api_scrape(body: ScrapeBody):
             delay=config.DELAY_BETWEEN_REQUESTS,
             no_json=False, no_jsonl=False, no_csv=False,
         )
-        pipeline.cmd_scrape(ns)
+        if not pipeline.cmd_scrape(ns):
+            raise RuntimeError("Scrape did not complete successfully; see the job log")
 
     job_id = _launch("scrape", run)
+    if job_id is None:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
     return {"job_id": job_id}
+
+
+class ManualBody(BaseModel):
+    url: str = ""
+    transcript: str = ""
+    description: str = ""
+    title: str = ""
+    channel: str = ""
+    published: str = ""
+    fetch_metadata: bool = True
+
+
+@app.post("/api/manual")
+def api_manual(body: ManualBody):
+    """
+    Add a hand-pasted transcript. Description and transcript stay separate —
+    the description goes to frontmatter, the transcript becomes segments.
+    """
+    if not body.url.strip():
+        return JSONResponse({"error": "url or video id required"}, status_code=400)
+    if not body.transcript.strip():
+        return JSONResponse({"error": "transcript is required"}, status_code=400)
+
+    # Validate cheaply up front so mistakes come back in the response rather
+    # than disappearing into a background job's log.
+    try:
+        video_id = pipeline._video_id_from(body.url)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    def run():
+        pipeline.add_manual(
+            body.url,
+            body.transcript,
+            description=body.description,
+            title=body.title,
+            channel=body.channel,
+            published=body.published,
+            output_dir=config.LOCAL_OUTPUT_DIR,
+            fetch_metadata=body.fetch_metadata,
+        )
+
+    job_id = _launch("manual", run)
+    if job_id is None:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
+    return {"job_id": job_id, "video_id": video_id}
 
 
 @app.post("/api/clean")
 def api_clean():
-    if _is_running():
-        return JSONResponse({"error": "A job is already running"}, status_code=409)
 
     def run():
         ns = argparse.Namespace(
             raw_dir=config.LOCAL_OUTPUT_DIR,
             blob_dir=config.BLOB_OUTPUT_DIR,
         )
-        pipeline.cmd_clean(ns)
+        if not pipeline.cmd_clean(ns):
+            raise RuntimeError("Clean did not complete successfully; see the job log")
 
     job_id = _launch("clean", run)
+    if job_id is None:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
     return {"job_id": job_id}
 
 
 @app.post("/api/ingest")
 def api_ingest():
-    if _is_running():
-        return JSONResponse({"error": "A job is already running"}, status_code=409)
 
     def run():
         ns = argparse.Namespace(
             blob_dir=config.BLOB_OUTPUT_DIR,
             clean_dir=config.CLEAN_OUTPUT_DIR,
         )
-        pipeline.cmd_ingest(ns)
+        if not pipeline.cmd_ingest(ns):
+            raise RuntimeError("Ingest did not complete successfully; see the job log")
 
     job_id = _launch("ingest", run)
+    if job_id is None:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
+    return {"job_id": job_id}
+
+
+def _low_priority() -> None:
+    """
+    Drop the current job thread to the lowest CPU priority — the in-process
+    equivalent of enrich.sh's `nice -n 19`. On Linux nice is per-thread, so the
+    web server itself stays responsive while enrichment grinds away.
+    """
+    try:
+        os.nice(19)
+    except OSError as exc:
+        logger.warning("Could not lower job priority: %s", exc)
+
+
+def _enrich_ns(limit: int = 0):
+    return argparse.Namespace(
+        raw_dir=config.LOCAL_OUTPUT_DIR,
+        blob_dir=config.BLOB_OUTPUT_DIR,
+        limit=limit,
+        loop=False,      # the UI never runs the polling worker
+        poll=60,
+    )
+
+
+class EnrichBody(BaseModel):
+    limit: int = Field(default=0, ge=0)  # 0 = drain the whole queue
+
+
+@app.post("/api/enrich")
+def api_enrich(body: EnrichBody | None = None):
+
+    limit = body.limit if body else 0
+
+    def run():
+        _low_priority()
+        if not pipeline.cmd_enrich(_enrich_ns(limit)):
+            raise RuntimeError("Enrichment did not complete successfully; see the job log")
+
+    job_id = _launch("enrich", run)
+    if job_id is None:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
+    return {"job_id": job_id}
+
+
+class RunAllBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str = ""        # optional — scrape this first
+
+
+@app.post("/api/run-all")
+def api_run_all(body: RunAllBody | None = None):
+    """
+    Run the whole pipeline back to back in one job: scrape (only when a URL is
+    given) → clean → enrich → ingest. A failed stage stops every dependent
+    downstream stage.
+    """
+    url = (body.url if body else "").strip()
+
+    def run():
+        def run_enrich():
+            _low_priority()
+            return pipeline.cmd_enrich(_enrich_ns(0))
+
+        stages = []
+        if url:
+            stages.append(("scrape", lambda: pipeline.cmd_scrape(argparse.Namespace(
+                url_or_file=url,
+                output=config.LOCAL_OUTPUT_DIR,
+                lang=config.DEFAULT_LANG,
+                delay=config.DELAY_BETWEEN_REQUESTS,
+                no_json=False, no_jsonl=False, no_csv=False,
+            ))))
+        stages += [
+            ("clean", lambda: pipeline.cmd_clean(argparse.Namespace(
+                raw_dir=config.LOCAL_OUTPUT_DIR,
+                blob_dir=config.BLOB_OUTPUT_DIR,
+            ))),
+            ("enrich", run_enrich),
+            ("ingest", lambda: pipeline.cmd_ingest(argparse.Namespace(
+                blob_dir=config.BLOB_OUTPUT_DIR,
+                clean_dir=config.CLEAN_OUTPUT_DIR,
+            ))),
+        ]
+
+        for i, (name, fn) in enumerate(stages, 1):
+            logger.info("──── [%d/%d] %s ────", i, len(stages), name)
+            if fn() is not True:
+                raise RuntimeError(
+                    f"Stage '{name}' did not complete successfully; "
+                    "downstream stages were not started"
+                )
+        logger.info("──── run-all complete ────")
+
+    job_id = _launch("run-all", run)
+    if job_id is None:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
     return {"job_id": job_id}
 
 
@@ -184,8 +338,9 @@ def stream_job(job_id: str):
         while True:
             try:
                 msg = q.get(timeout=30)
-                if msg is None:
-                    yield "event: done\ndata: \n\n"
+                if isinstance(msg, tuple) and msg[0] == "done":
+                    _job_queues.pop(job_id, None)
+                    yield f"event: done\ndata: {msg[1]}\n\n"
                     return
                 safe = msg.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
                 yield f"data: {safe}\n\n"
