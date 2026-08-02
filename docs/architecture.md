@@ -17,10 +17,10 @@ Build a personal knowledge base from YouTube transcripts that is:
 | Resource | Capacity | Usage |
 |---|---|---|
 | `/srv/dbdata` | ~150 GB total, ~30 GB for markdowns | PostgreSQL, MongoDB, Qdrant, Chroma, ingested `.md` files |
-| `/media/ghost/Blob Storage` | ~300 GB | Blob storage — cleaned files sit here for human review before ingestion |
+| `/media/ghost/external_storage` | ~300 GB | Blob storage — cleaned files sit here for human review before ingestion |
 | `./output` | Temporary, inside app | Raw scraped files (staging only) |
 
-## Three-Stage Pipeline
+## Four-Stage Pipeline
 
 ```
 YouTube URL / Playlist / Channel
@@ -42,8 +42,17 @@ YouTube URL / Playlist / Channel
 │               │  → heuristic heading detection (fallback when no chapters)
 │               │  → adaptive paragraph gap (derived from video's own pacing)
 │               │  → strip vocal fillers; reject < 200 prose words
-│               │  → /media/ghost/Blob Storage/yt_transcripts/<Channel>/<Title>.md
-│               │  → PostgreSQL: status = 'cleaned'
+│               │  → /media/ghost/external_storage/yt_transcripts/<Channel>/<Title>.md
+│               │  → PostgreSQL: status = 'cleaned', enrichment = 'pending'
+└───────────────┘
+        │
+        ▼
+┌───────────────┐
+│ enrich stage  │  local Ollama model (qwen3:4b by default)
+│               │  → summary, concepts, domains, difficulty, content kind
+│               │  → PostgreSQL sections + processing run audit
+│               │  → rewrite blob .md as a structured knowledge document
+│               │  → enrichment_status = 'done'
 └───────────────┘
         │  ← human reviews / edits .md files in blob storage here
         ▼
@@ -70,7 +79,7 @@ Both `yt-dlp` and `youtube-transcript-api` work without a YouTube Data API key, 
 Raw files act as a local cache. The `clean` command reads from `dataset.jsonl` rather than re-fetching from YouTube — faster, offline-capable, and idempotent.
 
 ### Blob storage as review buffer
-Cleaned files go to `/media/ghost/Blob Storage/` first, not directly to `/srv/dbdata`. This allows human inspection and manual editing before any file touches the production database store. `ingest` is the explicit approval gate — delete unwanted files from blob before running it.
+Cleaned files go to `/media/ghost/external_storage/` first, not directly to `/srv/dbdata`. This allows human inspection and manual editing before any file touches the production database store. `ingest` is the explicit approval gate — delete unwanted files from blob before running it.
 
 ### Adaptive cleaning, not hardcoded rules
 Different videos have wildly different pacing and structure. The cleaner derives paragraph break thresholds from each video's own segment gap distribution (80th percentile), and uses YouTube chapter markers as headings when available — falling back to heuristic detection only when the creator didn't add chapters.
