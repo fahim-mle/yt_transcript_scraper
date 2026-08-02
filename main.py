@@ -30,13 +30,14 @@ import os
 import re
 import shutil
 import time
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import config
 from database import db
-from scraper import cleaner, formatter, llm_processor, resolver, transcript
+from scraper import cleaner, formatter, llm_processor, manual, resolver, transcript
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +84,24 @@ def _db_available() -> bool:
     return bool(os.environ.get("DATABASE_URL"))
 
 
+def _find_staged_record(output_dir: str, video_id: str) -> dict | None:
+    """Return the existing aggregate record for a video, if one is staged."""
+    path = os.path.join(output_dir, "dataset.jsonl")
+    if not os.path.exists(path):
+        return None
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("video_id") == video_id:
+                return record
+    return None
+
+
+
+
 # ── scrape ────────────────────────────────────────────────────────────────
 
 def _scrape_video(meta: dict, output_dir: str, lang: str, save_json: bool) -> dict:
@@ -107,14 +126,14 @@ def _scrape_video(meta: dict, output_dir: str, lang: str, save_json: bool) -> di
     return formatter.to_jsonl_record(meta, segments, md_path)
 
 
-def cmd_scrape(args: argparse.Namespace) -> None:
+def cmd_scrape(args: argparse.Namespace) -> bool:
     output_dir = args.output
 
     logger.info("Resolving: %s", args.url_or_file)
     videos = resolver.resolve(args.url_or_file)
     if not videos:
         logger.error("No videos found.")
-        return
+        return False
 
     logger.info("Found %d video(s). Raw output → %s", len(videos), output_dir)
     if not _db_available():
@@ -184,6 +203,166 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
     logger.info("Done. %d saved, %d skipped, %d failed.%s",
                 success, skipped, len(failures), " RUN ABORTED." if aborted else "")
+    return not aborted and (success + skipped > 0)
+
+
+# ── manual paste ──────────────────────────────────────────────────────────
+
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YOUTUBE_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+    "youtube-nocookie.com", "www.youtube-nocookie.com",
+}
+
+
+def _video_id_from(source: str) -> str:
+    """Extract an exact video ID from supported YouTube URLs or a bare ID."""
+    source = (source or "").strip()
+    if _YOUTUBE_VIDEO_ID_RE.fullmatch(source):
+        return source
+
+    candidate = ""
+    parsed = urlparse(source if "://" in source else f"https://{source}")
+    host = (parsed.hostname or "").lower()
+    parts = [part for part in parsed.path.split("/") if part]
+
+    if host == "youtu.be" and parts:
+        candidate = parts[0]
+    elif host in _YOUTUBE_HOSTS:
+        if parsed.path.rstrip("/") == "/watch":
+            candidate = (parse_qs(parsed.query).get("v") or [""])[0]
+        elif len(parts) == 2 and parts[0] in {"shorts", "embed", "live"}:
+            candidate = parts[1]
+
+    if _YOUTUBE_VIDEO_ID_RE.fullmatch(candidate):
+        return candidate
+    raise ValueError(f"Could not find a valid YouTube video id in {source!r}")
+
+
+def add_manual(
+    source: str,
+    transcript_text: str,
+    description: str = "",
+    title: str = "",
+    channel: str = "",
+    published: str = "",
+    output_dir: str = config.LOCAL_OUTPUT_DIR,
+    save_json: bool = config.SAVE_JSON,
+    fetch_metadata: bool = True,
+) -> dict:
+    """
+    Ingest a hand-pasted transcript as if it had been scraped.
+
+    Writes the same raw .md/.json and dataset.jsonl record the scraper produces,
+    so clean → enrich → ingest run unchanged afterwards.
+
+    Metadata is *not* blocked by YouTube even when transcripts are, so title,
+    channel and chapters are fetched with yt-dlp when possible; anything passed
+    in explicitly wins, and the whole lookup is best-effort.
+    """
+    video_id = _video_id_from(source)
+    existing = _find_staged_record(output_dir, video_id)
+    if existing is not None:
+        location = existing.get("md_path") or video_id
+        raise FileExistsError(f"Already staged: {location}")
+
+    segments = manual.parse_transcript(transcript_text)
+
+    meta = {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": "", "channel": "", "channel_id": "",
+        "published": "", "description": "", "chapters": [],
+    }
+
+    if fetch_metadata:
+        try:
+            fetched = resolver.resolve(meta["url"])
+            if fetched:
+                meta.update(fetched[0])
+                logger.info("Fetched metadata: %s — %s",
+                            meta.get("channel", ""), meta.get("title", ""))
+        except Exception as exc:
+            logger.warning("Metadata lookup failed (%s) — using what you provided.", exc)
+
+    # Explicit values win over anything fetched.
+    for key, val in (("title", title), ("channel", channel),
+                     ("published", published), ("description", description)):
+        if val and val.strip():
+            meta[key] = val.strip()
+
+    if meta["published"]:
+        published_text = str(meta["published"]).strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", published_text):
+            raise ValueError("published date must use YYYY-MM-DD")
+        try:
+            meta["published"] = dt.date.fromisoformat(published_text).isoformat()
+        except ValueError:
+            raise ValueError("published date must be a real date in YYYY-MM-DD format") from None
+
+    if not meta["title"]:
+        meta["title"] = video_id
+    if not meta["channel"]:
+        meta["channel"] = "unknown_channel"
+
+    md_path, json_path = _output_paths(output_dir, meta)
+    if os.path.exists(md_path):
+        raise FileExistsError(f"Already scraped: {md_path}")
+
+    os.makedirs(os.path.dirname(md_path), exist_ok=True)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(formatter.to_markdown(meta, segments))
+    if save_json:
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(formatter.to_json(segments))
+
+    record = formatter.to_jsonl_record(meta, segments, md_path)
+    logger.info("Saved raw: %s (%d words)", md_path, record["word_count"])
+
+    _write_local_aggregate([record], output_dir, no_jsonl=False, no_csv=False)
+
+    if _db_available():
+        try:
+            db.upsert_video({
+                **meta,
+                "word_count": record["word_count"],
+                "raw_path":   record["md_path"],
+                "status":     "raw",
+            })
+        except Exception as exc:
+            logger.warning("DB upsert failed for %s: %s", video_id, exc)
+
+    logger.info("Manual entry complete — run 'clean' next.")
+    return record
+
+
+def cmd_manual(args: argparse.Namespace) -> bool:
+    transcript_text = _read_arg_or_file(args.transcript, args.transcript_file)
+    description = _read_arg_or_file(args.description, args.description_file)
+
+    try:
+        add_manual(
+            args.url,
+            transcript_text,
+            description=description,
+            title=args.title,
+            channel=args.channel,
+            published=args.published,
+            output_dir=args.output,
+            save_json=not args.no_json,
+            fetch_metadata=not args.no_metadata,
+        )
+        return True
+    except (ValueError, FileExistsError) as exc:
+        logger.error("%s", exc)
+        return False
+
+
+def _read_arg_or_file(inline: str, path: str) -> str:
+    if path:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return inline or ""
 
 
 def _report_failures(failures: list[dict], output_dir: str) -> None:
@@ -247,20 +426,35 @@ def _sections_with_timestamps(sections: list[dict], chapters: list[dict]) -> lis
 
 # ── clean ─────────────────────────────────────────────────────────────────
 
-def _persist_clean_row(meta: dict, cleaned_text: str) -> None:
-    """Ensure the video row exists, mark it cleaned and pending enrichment."""
+def _persist_clean_row(
+    meta: dict,
+    cleaned_text: str,
+    *,
+    requeue: bool,
+) -> tuple[bool, bool]:
+    """Synchronize a clean blob with PostgreSQL; return (success, queued)."""
     video_id = meta["video_id"]
     wc = len(cleaned_text.split())
     try:
-        if db.get_video(video_id) is None:
+        row = db.get_video(video_id)
+        if row is None:
             db.upsert_video({**meta, "word_count": wc, "status": "raw"})
-        db.update_video(video_id, {"status": "cleaned", "word_count": wc})
-        db.set_enrichment_status(video_id, "pending")
+            row = {}
+        if row.get("status") in {None, "raw"}:
+            db.update_video(video_id, {"status": "cleaned", "word_count": wc})
+
+        enrichment_status = row.get("enrichment_status")
+        if requeue or enrichment_status not in {"pending", "failed", "done"}:
+            if enrichment_status != "pending":
+                db.set_enrichment_status(video_id, "pending")
+            return True, True
+        return True, enrichment_status in {"pending", "failed"}
     except Exception as exc:
         logger.warning("DB update failed for %s: %s", video_id, exc)
+        return False, False
 
 
-def cmd_clean(args: argparse.Namespace) -> None:
+def cmd_clean(args: argparse.Namespace) -> bool:
     """
     Reads raw records from dataset.jsonl, applies the deterministic cleaning
     pipeline, and writes structured .md files to blob storage for review.
@@ -269,15 +463,16 @@ def cmd_clean(args: argparse.Namespace) -> None:
     resumable background job ('enrich'). Cleaned videos are queued for it by
     setting enrichment_status = 'pending'.
     """
-    raw_dir  = args.raw_dir
+    raw_dir = args.raw_dir
     blob_dir = args.blob_dir
     jsonl_path = os.path.join(raw_dir, "dataset.jsonl")
 
     if not os.path.exists(jsonl_path):
         logger.error("No dataset.jsonl at %s — run 'scrape' first.", jsonl_path)
-        return
+        return False
 
-    if not _db_available():
+    db_available = _db_available()
+    if not db_available:
         logger.warning("DATABASE_URL not set — skipping PostgreSQL status updates.")
 
     logger.info("Reading from %s", jsonl_path)
@@ -286,15 +481,31 @@ def cmd_clean(args: argparse.Namespace) -> None:
     with open(jsonl_path, encoding="utf-8") as f:
         records = [json.loads(line) for line in f if line.strip()]
 
-    saved, skipped, filtered = 0, 0, 0
+    saved, skipped, filtered, queued, errors = 0, 0, 0, 0, 0
     for rec in records:
         meta = _meta_from_record(rec)
         chapters = rec.get("chapters") or []
         channel_dir, blob_path = _blob_path_for(blob_dir, meta)
+        blob_exists = os.path.exists(blob_path)
 
-        if os.path.exists(blob_path):
-            skipped += 1
-            continue
+        if blob_exists:
+            try:
+                with open(blob_path, encoding="utf-8") as f:
+                    existing_video_id = _extract_video_id(f.read())
+            except OSError as exc:
+                logger.error("Could not read existing blob %s: %s", blob_path, exc)
+                errors += 1
+                continue
+            if existing_video_id != meta["video_id"]:
+                logger.error(
+                    "Blob identity mismatch at %s: expected %s, found %s",
+                    blob_path, meta["video_id"], existing_video_id or "no video id",
+                )
+                errors += 1
+                continue
+            if not db_available:
+                skipped += 1
+                continue
 
         segments = rec.get("transcript_segments", [])
         if not segments:
@@ -308,21 +519,31 @@ def cmd_clean(args: argparse.Namespace) -> None:
             filtered += 1
             continue
 
-        os.makedirs(channel_dir, exist_ok=True)
-        with open(blob_path, "w", encoding="utf-8") as f:
-            f.write(formatter.to_clean_markdown(meta, cleaned_text))
-        logger.info("Cleaned → %s", blob_path)
-        saved += 1
+        if blob_exists:
+            skipped += 1
+        else:
+            os.makedirs(channel_dir, exist_ok=True)
+            with open(blob_path, "w", encoding="utf-8") as f:
+                f.write(formatter.to_clean_markdown(meta, cleaned_text))
+            logger.info("Cleaned → %s", blob_path)
+            saved += 1
 
-        if _db_available():
-            _persist_clean_row(meta, cleaned_text)
+        if db_available:
+            persisted, is_queued = _persist_clean_row(
+                meta, cleaned_text, requeue=not blob_exists,
+            )
+            if not persisted:
+                errors += 1
+            elif is_queued:
+                queued += 1
 
     logger.info(
         "Clean done. %d written to blob, %d already existed, %d filtered.",
         saved, skipped, filtered,
     )
-    if saved and _db_available():
-        logger.info("Queued %d for enrichment. Run './enrich.sh' (or 'python main.py enrich').", saved)
+    if queued:
+        logger.info("%d video(s) queued for enrichment.", queued)
+    return errors == 0
 
 
 # ── enrich (background worker) ─────────────────────────────────────────────
@@ -369,35 +590,30 @@ def _enrich_one(video_id: str, rec: dict, blob_dir: str) -> str:
         return "failed"
 
     enrichment = result.enrichment.model_dump()
-    try:
-        db.update_video(video_id, {
-            "summary":      enrichment.get("summary"),
-            "key_concepts": enrichment.get("key_concepts") or [],
-            "domains":      enrichment.get("domains") or [],
-            "difficulty":   enrichment.get("difficulty"),
-            "content_kind": enrichment.get("content_kind"),
-        })
-        db.upsert_sections(
-            video_id,
-            _sections_with_timestamps(enrichment.get("sections") or [], chapters),
-        )
-    except Exception as exc:
-        logger.warning("DB write failed for %s: %s", video_id, exc)
+    db.update_video(video_id, {
+        "summary":      enrichment.get("summary"),
+        "key_concepts": enrichment.get("key_concepts") or [],
+        "domains":      enrichment.get("domains") or [],
+        "difficulty":   enrichment.get("difficulty"),
+        "content_kind": enrichment.get("content_kind"),
+    })
+    db.upsert_sections(
+        video_id,
+        _sections_with_timestamps(enrichment.get("sections") or [], chapters),
+    )
 
-    # Rewrite the review .md with the enriched frontmatter + structure.
+    # Both persisted metadata and the knowledge document are required before
+    # the row leaves the retry queue.
     channel_dir, blob_path = _blob_path_for(blob_dir, meta)
-    try:
-        os.makedirs(channel_dir, exist_ok=True)
-        with open(blob_path, "w", encoding="utf-8") as f:
-            f.write(formatter.to_knowledge_doc(meta, cleaned_text, enrichment))
-    except Exception as exc:
-        logger.warning("Blob rewrite failed for %s: %s", video_id, exc)
+    os.makedirs(channel_dir, exist_ok=True)
+    with open(blob_path, "w", encoding="utf-8") as f:
+        f.write(formatter.to_knowledge_doc(meta, cleaned_text, enrichment))
 
     db.set_enrichment_status(video_id, "done")
     return "done"
 
 
-def cmd_enrich(args: argparse.Namespace) -> None:
+def cmd_enrich(args: argparse.Namespace) -> bool:
     """
     Drain the enrichment queue (cleaned videos with enrichment_status pending
     or failed), oldest first. Idempotent and resumable: each video is marked
@@ -409,18 +625,19 @@ def cmd_enrich(args: argparse.Namespace) -> None:
     """
     if not _db_available():
         logger.error("enrich needs DATABASE_URL — it reads the queue from PostgreSQL.")
-        return
+        return False
     if not config.LLM_ENABLED:
         logger.error("LLM_ENABLED=0 — nothing to do. Set it to 1 in .env to enrich.")
-        return
+        return False
     if not llm_processor.is_available():
         logger.error("Ollama unreachable at %s — start it (`ollama serve`) and retry.",
                      config.OLLAMA_HOST)
-        return
+        return False
 
     logger.info("Enrich worker — model: %s%s", config.OLLAMA_MODEL,
                 "  (loop mode)" if args.loop else "")
     processed = 0
+    failures = 0
     while True:
         index = _load_records_index(args.raw_dir)
         pending = db.list_pending_enrichment(limit=args.limit or None)
@@ -437,6 +654,7 @@ def cmd_enrich(args: argparse.Namespace) -> None:
             if rec is None:
                 logger.warning("No dataset.jsonl record for %s — marking failed.", video_id)
                 db.set_enrichment_status(video_id, "failed")
+                failures += 1
                 continue
             logger.info("Enriching %s — %s", video_id, rec.get("title", ""))
             try:
@@ -449,16 +667,19 @@ def cmd_enrich(args: argparse.Namespace) -> None:
                     pass
                 outcome = "error"
             logger.info("  → %s", outcome)
+            if outcome in {"failed", "error"}:
+                failures += 1
             processed += 1
             if args.limit and processed >= args.limit:
                 logger.info("Reached --limit %d.", args.limit)
                 logger.info("Enrich worker done. %d processed.", processed)
-                return
+                return failures == 0
 
         if not args.loop:
             break
 
     logger.info("Enrich worker done. %d processed.", processed)
+    return failures == 0
 
 
 # ── benchmark ─────────────────────────────────────────────────────────────
@@ -589,23 +810,24 @@ def _extract_video_id(md_content: str) -> str | None:
     return m.group(1) if m else None
 
 
-def cmd_ingest(args: argparse.Namespace) -> None:
+def cmd_ingest(args: argparse.Namespace) -> bool:
     """
     Copies reviewed .md files from blob storage to /srv/dbdata and marks
-    them as ingested in PostgreSQL. Only copies files that have not already
-    been ingested (i.e. don't already exist at the destination).
+    them as ingested in PostgreSQL. Existing destination files are not copied
+    again, but their database state is repaired when necessary.
 
     You can delete unwanted files from blob storage before running ingest —
     only what's in the blob dir gets ingested.
     """
-    blob_dir  = args.blob_dir
+    blob_dir = args.blob_dir
     clean_dir = args.clean_dir
 
     if not os.path.isdir(blob_dir):
         logger.error("Blob directory not found: %s", blob_dir)
-        return
+        return False
 
-    if not _db_available():
+    db_available = _db_available()
+    if not db_available:
         logger.warning("DATABASE_URL not set — skipping PostgreSQL status updates.")
 
     logger.info("Ingesting from %s → %s", blob_dir, clean_dir)
@@ -617,34 +839,45 @@ def cmd_ingest(args: argparse.Namespace) -> None:
                 continue
 
             src = os.path.join(root, fname)
-            # Preserve channel subfolder structure
             rel = os.path.relpath(src, blob_dir)
             dst = os.path.join(clean_dir, rel)
 
-            if os.path.exists(dst):
-                skipped += 1
-                continue
-
             try:
-                content = open(src, encoding="utf-8").read()
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                logger.info("Ingested → %s", dst)
-                copied += 1
+                with open(src, encoding="utf-8") as f:
+                    content = f.read()
+                video_id = _extract_video_id(content)
+                if not video_id:
+                    raise ValueError(f"Could not extract video_id from {src}")
 
-                if _db_available():
-                    video_id = _extract_video_id(content)
-                    if video_id:
-                        try:
-                            db.update_video(video_id, {
-                                "status":     "ingested",
-                                "clean_path": dst,
-                            })
-                        except Exception as exc:
-                            logger.warning("DB update failed for %s: %s", video_id, exc)
-                    else:
-                        logger.warning("Could not extract video_id from %s", src)
+                if os.path.exists(dst):
+                    with open(dst, encoding="utf-8") as f:
+                        destination_video_id = _extract_video_id(f.read())
+                    if destination_video_id != video_id:
+                        raise ValueError(
+                            f"Destination identity mismatch at {dst}: "
+                            f"source={video_id}, destination={destination_video_id or 'no video id'}"
+                        )
+                    skipped += 1
+                else:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst)
+                    logger.info("Ingested → %s", dst)
+                    copied += 1
 
+                if db_available:
+                    current = db.get_video(video_id)
+                    if current is None:
+                        raise KeyError(f"No video found with video_id={video_id!r}")
+                    status = current.get("status")
+                    if status not in {"raw", "cleaned", "ingested", "embedded"}:
+                        raise ValueError(f"Cannot ingest video {video_id} from status {status!r}")
+                    updates = {}
+                    if status in {"raw", "cleaned"}:
+                        updates["status"] = "ingested"
+                    if current.get("clean_path") != dst:
+                        updates["clean_path"] = dst
+                    if updates:
+                        db.update_video(video_id, updates)
             except Exception as exc:
                 logger.error("Failed to ingest %s: %s", src, exc)
                 errors += 1
@@ -653,6 +886,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         "Ingest done. %d copied to /srv/dbdata, %d already existed, %d errors.",
         copied, skipped, errors,
     )
+    return errors == 0
 
 
 # ── setup-db ──────────────────────────────────────────────────────────────
@@ -736,6 +970,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-jsonl", action="store_true", help="Skip dataset.jsonl")
     sp.add_argument("--no-csv",   action="store_true", help="Skip index.csv")
 
+    # manual
+    mp = sub.add_parser("manual", help="Add a hand-pasted transcript (for when YouTube blocks fetching)")
+    mp.add_argument("url", help="YouTube URL or bare 11-character video id")
+    mp.add_argument("--transcript", help="Transcript text (or use --transcript-file)")
+    mp.add_argument("--transcript-file", help="Read transcript from a UTF-8 text file")
+    mp.add_argument("--description", default="", help="Video description text")
+    mp.add_argument("--description-file", help="Read description from a file")
+    mp.add_argument("--title",     default="", help="Overrides the fetched title")
+    mp.add_argument("--channel",   default="", help="Overrides the fetched channel")
+    mp.add_argument("--published", default="", help="Overrides the fetched date (YYYY-MM-DD)")
+    mp.add_argument("--output",    default=config.LOCAL_OUTPUT_DIR)
+    mp.add_argument("--no-json",   action="store_true", help="Skip the per-video .json segment file")
+    mp.add_argument("--no-metadata", action="store_true",
+                    help="Skip the yt-dlp metadata lookup (offline / fully manual)")
+
     # clean
     cp = sub.add_parser("clean", help="Clean raw transcripts → blob storage for review")
     cp.add_argument("--raw-dir",  default=config.LOCAL_OUTPUT_DIR)
@@ -771,14 +1020,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    {
+    command = {
         "scrape":    cmd_scrape,
+        "manual":    cmd_manual,
         "clean":     cmd_clean,
         "enrich":    cmd_enrich,
         "benchmark": cmd_benchmark,
         "ingest":    cmd_ingest,
         "setup-db":  cmd_setup_db,
-    }[args.command](args)
+    }[args.command]
+    if command(args) is False:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
