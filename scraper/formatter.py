@@ -19,7 +19,8 @@ def format_timestamp(seconds: float) -> str:
 def sanitize_filename(name: str, max_len: int = 100) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
     name = re.sub(r"\s+", "_", name.strip())
-    return name[:max_len] or "untitled"
+    name = name[:max_len]
+    return "untitled" if name in {"", ".", ".."} else name
 
 
 def to_markdown(metadata: dict, segments: list[dict]) -> str:
