@@ -127,6 +127,77 @@
     input[type="text"]:focus  { border-color: var(--accent); }
     input[type="text"]::placeholder { color: var(--muted); }
 
+    /* ── Manual paste ──────────────────────────── */
+    .manual-wrap { margin-bottom: 12px; }
+
+    .manual-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+    .manual-toggle:hover { color: var(--text); }
+    .manual-toggle .chev { transition: transform 0.15s; font-size: 9px; }
+    .manual-wrap.open .manual-toggle .chev { transform: rotate(90deg); }
+
+    .manual-body { display: none; margin-top: 12px; }
+    .manual-wrap.open .manual-body { display: block; }
+
+    .manual-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    @media (max-width: 720px) { .manual-grid { grid-template-columns: 1fr; } }
+
+    .field { display: flex; flex-direction: column; gap: 5px; }
+    .field label {
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .field .hint { font-weight: 400; color: var(--border); }
+
+    textarea {
+      background: var(--log-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 9px 11px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.5;
+      outline: none;
+      resize: vertical;
+      transition: border-color 0.15s;
+      width: 100%;
+    }
+    textarea:focus { border-color: var(--accent); }
+    textarea::placeholder { color: var(--muted); opacity: 0.6; }
+
+    .manual-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .manual-actions .spacer { flex: 1; }
+    .checkline {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .checkline input { accent-color: var(--accent); }
+
     .btn {
       padding: 7px 14px;
       border-radius: 6px;
@@ -304,10 +375,61 @@
       </div>
       <div class="stage-row">
         <button class="btn btn-secondary" id="btn-clean"  onclick="runStage('clean')">Clean</button>
+        <button class="btn btn-secondary" id="btn-enrich" onclick="runStage('enrich')">Enrich</button>
         <button class="btn btn-secondary" id="btn-ingest" onclick="runStage('ingest')">Ingest</button>
+        <button class="btn btn-primary"   id="btn-runall" onclick="runAll()"
+                title="Runs clean → enrich → ingest back to back (scrape first if a URL is in the box)">Run All</button>
         <div id="job-indicator">
           <div class="spinner"></div>
           <span id="job-label">running…</span>
+        </div>
+      </div>
+
+      <!-- Manual paste — for when YouTube blocks transcript fetching -->
+      <div class="manual-wrap" id="manual-wrap" style="margin-top:12px;">
+        <div class="manual-toggle" onclick="toggleManual()">
+          <span class="chev">▶</span>
+          <span>Paste transcript manually</span>
+        </div>
+
+        <div class="manual-body">
+          <div class="field" style="margin-bottom:10px;">
+            <label for="m-url">Video URL or ID <span class="hint">— required</span></label>
+            <input type="text" id="m-url" placeholder="https://www.youtube.com/watch?v=… or the 11-character id">
+          </div>
+
+          <div class="field" style="margin-bottom:10px;">
+            <label for="m-description">Description <span class="hint">— paste the description box text</span></label>
+            <textarea id="m-description" rows="4"
+                      placeholder="Paste the video description here…"></textarea>
+          </div>
+
+          <div class="field">
+            <label for="m-transcript">Transcript <span class="hint">— required; timestamps, SRT/VTT or plain text all work</span></label>
+            <textarea id="m-transcript" rows="10"
+                      placeholder="Paste the transcript here…&#10;&#10;0:00 works, as does plain prose with no timestamps."></textarea>
+          </div>
+
+          <div class="manual-grid" style="margin-top:10px;">
+            <div class="field">
+              <label for="m-title">Title <span class="hint">— optional</span></label>
+              <input type="text" id="m-title" placeholder="Auto-fetched if left blank">
+            </div>
+            <div class="field">
+              <label for="m-channel">Channel <span class="hint">— optional</span></label>
+              <input type="text" id="m-channel" placeholder="Auto-fetched if left blank">
+            </div>
+          </div>
+
+          <div class="manual-actions">
+            <label class="checkline">
+              <input type="checkbox" id="m-fetch-meta" checked>
+              Fetch title/channel/chapters with yt-dlp
+            </label>
+            <div class="spacer"></div>
+            <button class="btn btn-secondary" onclick="clearManual()">Clear</button>
+            <button class="btn btn-primary" id="btn-manual" onclick="submitManual()">Add transcript</button>
+          </div>
         </div>
       </div>
     </div>
@@ -359,7 +481,7 @@
 
   function setRunning(on, label) {
     _running = on;
-    ['btn-scrape','btn-clean','btn-ingest'].forEach(id => {
+    ['btn-scrape','btn-clean','btn-enrich','btn-ingest','btn-runall','btn-manual'].forEach(id => {
       document.getElementById(id).disabled = on;
     });
     const ind = document.getElementById('job-indicator');
@@ -387,7 +509,7 @@
 
   // ── SSE stream ───────────────────────────────────────────────────
 
-  function streamJob(jobId, label) {
+  function streamJob(jobId, label, onSuccess = null) {
     if (_es) _es.close();
     clearLog();
     setRunning(true, label);
@@ -396,9 +518,12 @@
 
     _es.onmessage = e => appendLog(e.data);
 
-    _es.addEventListener('done', () => {
+    _es.addEventListener('done', e => {
+      const succeeded = e.data === 'done';
       _es.close();
       setRunning(false);
+      if (succeeded && onSuccess) onSuccess();
+      if (!succeeded) showError(`${label} failed — check the log.`);
       loadVideos();
     });
 
@@ -430,13 +555,73 @@
     .catch(e => showError(String(e)));
   }
 
+  // ── Manual paste ─────────────────────────────────────────────────
+
+  function toggleManual() {
+    document.getElementById('manual-wrap').classList.toggle('open');
+  }
+
+  function clearManual() {
+    ['m-url', 'm-description', 'm-transcript', 'm-title', 'm-channel']
+      .forEach(id => document.getElementById(id).value = '');
+  }
+
+  function submitManual() {
+    if (_running) return;
+    const val = id => document.getElementById(id).value.trim();
+
+    if (!val('m-url'))        { showError('Video URL or ID is required'); return; }
+    if (!val('m-transcript')) { showError('Transcript is required');      return; }
+
+    fetch('/api/manual', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        url:            val('m-url'),
+        transcript:     document.getElementById('m-transcript').value,
+        description:    document.getElementById('m-description').value,
+        title:          val('m-title'),
+        channel:        val('m-channel'),
+        fetch_metadata: document.getElementById('m-fetch-meta').checked,
+      }),
+    })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { showError(d.error); return; }
+      streamJob(d.job_id, 'adding transcript', clearManual);
+    })
+    .catch(e => showError(String(e)));
+  }
+
+  const STAGE_LABEL = {clean: 'cleaning', enrich: 'enriching', ingest: 'ingesting'};
+
   function runStage(stage) {
     if (_running) return;
-    fetch(`/api/${stage}`, {method: 'POST'})
+    fetch(`/api/${stage}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    })
       .then(r => r.json())
       .then(d => {
         if (d.error) { showError(d.error); return; }
-        streamJob(d.job_id, stage + 'ing');
+        streamJob(d.job_id, STAGE_LABEL[stage] || stage);
+      })
+      .catch(e => showError(String(e)));
+  }
+
+  function runAll() {
+    if (_running) return;
+    const url = document.getElementById('url-input').value.trim();
+    fetch('/api/run-all', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: url}),
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { showError(d.error); return; }
+        streamJob(d.job_id, url ? 'scrape → clean → enrich → ingest' : 'clean → enrich → ingest');
       })
       .catch(e => showError(String(e)));
   }
