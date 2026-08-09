@@ -146,6 +146,71 @@ def to_knowledge_doc(metadata: dict, cleaned_text: str, enrichment: dict | None)
     return "\n".join(lines)
 
 
+# Marks the start of rewritten prose. `enrich` reads the body back out from
+# here, so it can add metadata without paying for the rewrite a second time.
+ARTICLE_MARKER = "## Article"
+
+_ARTICLE_BODY_RE = re.compile(rf"^{re.escape(ARTICLE_MARKER)}\s*$", re.MULTILINE)
+
+
+def extract_article_body(md_content: str) -> str | None:
+    """Return the article prose from a rendered article doc, or None."""
+    m = _ARTICLE_BODY_RE.search(md_content)
+    if not m:
+        return None
+    body = md_content[m.end():].strip()
+    return body or None
+
+
+def to_article_doc(metadata: dict, article_body: str, enrichment: dict | None = None) -> str:
+    """
+    The primary artifact: enriched frontmatter, then the rewritten article.
+
+    The verbatim transcript is NOT included — it lives beside this file as
+    `<stem>.transcript.md` so the readable version stays readable and the
+    ground truth stays citable.
+    """
+    lines = ["---"] + _frontmatter_lines(metadata, enrichment) + ["---", ""]
+
+    if enrichment:
+        summary = (enrichment.get("summary") or "").strip()
+        key_concepts = enrichment.get("key_concepts") or []
+        if summary:
+            lines += ["## Summary", "", summary, ""]
+        if key_concepts:
+            lines += ["## Key Concepts", ""] + [f"- {c}" for c in key_concepts] + [""]
+
+    lines += [ARTICLE_MARKER, "", article_body, ""]
+    return "\n".join(lines)
+
+
+def to_transcript_doc(metadata: dict, cleaned_text: str) -> str:
+    """The verbatim companion — unmodified cleaned prose, for citation and embedding."""
+    return to_clean_markdown(metadata, cleaned_text)
+
+
+def _frontmatter_lines(metadata: dict, enrichment: dict | None) -> list[str]:
+    """Shared frontmatter body (no fences) for the article and knowledge docs."""
+    description = (metadata.get("description") or "").strip()
+    lines = [
+        f'title: "{_escape_yaml(metadata.get("title", ""))}"',
+        f'channel: "{_escape_yaml(metadata.get("channel", ""))}"',
+        f'published: "{metadata.get("published", "")}"',
+        f'url: "{metadata.get("url", "")}"',
+    ]
+    if enrichment:
+        summary = (enrichment.get("summary") or "").strip()
+        lines += [
+            f'difficulty: "{enrichment.get("difficulty") or ""}"',
+            f'content_kind: "{enrichment.get("content_kind") or ""}"',
+            f"domains: {_yaml_flow_list(enrichment.get('domains') or [])}",
+            f"key_concepts: {_yaml_flow_list(enrichment.get('key_concepts') or [])}",
+            f"summary: {_yaml_block_scalar(summary) if summary else '\"\"'}",
+        ]
+    lines.append(f"description: {_yaml_block_scalar(description) if description else '\"\"'}")
+    return lines
+
+
 def to_json(segments: list[dict]) -> str:
     return json.dumps(segments, ensure_ascii=False, indent=2)
 

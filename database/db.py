@@ -216,6 +216,37 @@ def set_enrichment_status(video_id: str, status: str) -> None:
             )
 
 
+def list_pending_rewrite(limit: int | None = None) -> list[str]:
+    """
+    Return video_ids that are cleaned but not yet rewritten, oldest first (FIFO).
+    'failed' rows are included so a later run can retry them.
+    """
+    sql = (
+        "SELECT video_id FROM videos "
+        "WHERE status IN ('cleaned', 'ingested') "
+        "AND rewrite_status IN ('pending', 'failed') "
+        "ORDER BY created_at ASC"
+    )
+    params: list = []
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [r[0] for r in cur.fetchall()]
+
+
+def set_rewrite_status(video_id: str, status: str) -> None:
+    """Set the rewrite queue state (pending | done | failed). Transient state."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE videos SET rewrite_status = %s WHERE video_id = %s",
+                (status, video_id),
+            )
+
+
 def get_sections(video_id: str) -> list[dict]:
     with _conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

@@ -5,8 +5,13 @@ knowledge base — designed for ML pipelines, semantic search, and long-term
 learning. Driven from a CLI or a local web UI.
 
 ```text
-scrape  →  clean  →  enrich  →  ingest
+scrape  →  clean  →  rewrite  →  enrich  →  ingest
 ```
+
+Each video ends up as **two files**: `<Title>.md`, a readable article rewritten
+from the captions, and `<Title>.transcript.md`, the verbatim cleaned transcript
+it came from. The article is generated prose, so the transcript stays alongside
+it as the citation and embedding anchor.
 
 No YouTube Data API key is required, and nothing leaves your machine: metadata
 comes from `yt-dlp`, transcripts from `youtube-transcript-api`, and enrichment
@@ -20,7 +25,8 @@ from a local Ollama model.
 |---|---|---|
 | **scrape** | Resolves any video / playlist / channel URL (or a `.txt` file of URLs), downloads transcripts + metadata + chapters. | `./output/<Channel>/<Title>.md` and `.json`, `dataset.jsonl`, `index.csv`, PostgreSQL `status='raw'` |
 | **manual** *(fallback)* | Accepts a hand-pasted transcript when YouTube blocks transcript delivery, producing byte-identical downstream records. | same as `scrape` |
-| **clean** | Deterministic, no LLM: merges caption segments into paragraphs, injects YouTube chapters as headings, strips fillers, rejects short transcripts. | blob storage `.md` for review, `status='cleaned'`, `enrichment_status='pending'` |
+| **clean** | Deterministic, no LLM: merges caption segments into paragraphs, injects YouTube chapters as headings, strips fillers, rejects short transcripts. | blob storage `.md` + verbatim `.transcript.md`, `status='cleaned'`, queued for rewrite and enrichment |
+| **rewrite** | Background, resumable worker: a local LLM rewrites the caption prose into a readable article — chunked, lossless, coverage-guarded. Never summarises. | article replaces the blob `.md`; `rewrite_status='done'` |
 | **enrich** | Background, resumable worker: a local LLM derives summary, key concepts, domains, difficulty, content kind, and sections, then rewrites the review `.md` as a knowledge document. | PostgreSQL content metadata + `sections` + `processing_runs`, `enrichment_status='done'` |
 | **ingest** | Copies reviewed `.md` into production storage — the explicit human approval gate. | `/srv/dbdata/markdowns/yt_transcripts_structured/`, `status='ingested'` |
 
@@ -92,8 +98,9 @@ for semantic search and a graph view.
   holding a different video's content is rejected, never silently repointed.
 - Each stage reports success or failure. The CLI exits non-zero on failure, and
   the web UI marks the job errored.
-- FastAPI web UI with live SSE logs, single-flight job locking, and a **Run All**
-  that stops at the first failed stage instead of ingesting incomplete work.
+- FastAPI web UI with live SSE logs, replayable job streams that survive a page
+  reload, and a **Run All** that stops at the first failed stage instead of
+  ingesting incomplete work.
 
 ---
 
@@ -151,11 +158,19 @@ streams live into the log panel.
 | **Ingest** | Copies reviewed `.md` files into production storage |
 | **Run All** | scrape → clean → enrich → ingest in one job (scrape only when a URL is in the box) |
 
-Only one job runs at a time; the other buttons disable themselves while it is in
-flight, and a second concurrent submission is rejected with HTTP 409. **Run All**
-stops at the first failed stage — ingest never runs after a failed clean or
-enrich. A failed job ends the log stream with an error, and the manual form keeps
-whatever you pasted so nothing is lost.
+Pipeline jobs are single-flight: the pipeline buttons disable themselves while
+one is in flight, and a second concurrent submission is rejected with HTTP 409.
+**Adding a transcript manually is exempt** — it is a couple of file writes, so it
+runs alongside a multi-hour **Run All** instead of queueing behind it. **Run All**
+stops at the first failed stage, but a video the LLM fails on is queue state, not
+a stage failure: it stays queued for the next run and ingest still publishes
+everything that did make it through. A failed job ends the log stream with an
+error, and the manual form keeps whatever you pasted so nothing is lost.
+
+The log stream is resumable. Every line carries a sequence number, so a reload —
+or a dropped connection — reattaches to the running job and replays what you
+missed instead of reporting a phantom failure. `/api/status` is polled and is the
+only thing that decides whether a button is disabled.
 
 Below the buttons, *Paste transcript manually* opens the blocked-transcript
 fallback.
@@ -166,6 +181,7 @@ fallback.
 python main.py scrape "https://www.youtube.com/@ChannelHandle"
 python main.py manual "https://youtu.be/VIDEO_ID" --transcript-file t.txt
 python main.py clean
+python main.py rewrite       # slow — see "Rewriting into articles" below
 ./enrich.sh                  # or: python main.py enrich
 python main.py ingest
 ```
@@ -175,6 +191,7 @@ python main.py ingest
 | `scrape <url_or_file>` | Download raw transcripts | `--output`, `--lang`, `--delay`, `--no-json`, `--no-jsonl`, `--no-csv` |
 | `manual <url_or_id>` | Add a hand-pasted transcript | `--transcript(-file)`, `--description(-file)`, `--title`, `--channel`, `--published`, `--no-metadata` |
 | `clean` | Clean raw transcripts into blob storage | `--raw-dir`, `--blob-dir` |
+| `rewrite` | Rewrite cleaned transcripts into articles | `--limit`, `--loop`, `--poll`, `--raw-dir`, `--blob-dir` |
 | `enrich` | Drain the enrichment queue | `--limit`, `--loop`, `--poll`, `--raw-dir`, `--blob-dir` |
 | `benchmark` | Compare models on one transcript | `--models`, `--video`, `--words`, `--out` |
 | `ingest` | Copy approved files to production | `--blob-dir`, `--clean-dir` |
@@ -244,6 +261,40 @@ worker drains that queue FIFO and marks each `done`.
 Set `LLM_ENABLED=0` in `.env` to skip enrichment entirely; the rest of the
 pipeline is unaffected.
 
+### Rewriting into articles
+
+`clean` gives you caption text with paragraph breaks. `rewrite` turns that into
+something you actually read: disfluencies repaired, punctuation restored,
+speaker turns attributed, enumerations as lists, headings where the subject
+changes.
+
+```bash
+python main.py rewrite            # drain the queue, then exit
+python main.py rewrite --limit 3  # prove it on a few videos first
+python main.py rewrite --loop     # keep polling for new work
+```
+
+It is **lossless by design** — the opposite of summarising:
+
+- **Chunked on paragraph boundaries.** A chunk never ends mid-sentence, because
+  chunks are built from whole paragraphs. Chapter headings force a boundary, so
+  a heavily chaptered video produces more, smaller chunks than
+  `REWRITE_CHUNK_WORDS` suggests.
+- **Seams flow.** Each chunk is shown the last `REWRITE_CONTEXT_WORDS` of the
+  *previous chunk's output* and told to continue from it. That is context, not
+  input — it is never rewritten twice, so nothing is duplicated in the article.
+- **Coverage is enforced.** Every rewritten chunk is checked against its source:
+  the word ratio must stay in a band, and the chunk's distinctive content words
+  must survive. A failure retries at a lower temperature, then falls back to the
+  verbatim chunk. The article is never quietly shorter than the transcript — a
+  bad chunk degrades to unpolished prose, never to missing prose.
+
+Rewriting is the slowest thing this project does: it generates roughly one token
+per transcript token. Budget hours per long video, and run it overnight or from
+cron like `enrich`. It is resumable, so interrupting it is always safe.
+
+Currently CLI-only — there is no web UI button for it yet.
+
 ### Choosing a model
 
 ```bash
@@ -276,8 +327,14 @@ model spills to CPU and is much slower. Benchmark before committing.
 | `YT_PROXY_HTTP(S)`, `YT_WEBSHARE_*`, `YT_COOKIE_FILE` | unset | Optional routing around a persistent block, or cookies for gated videos |
 | `LLM_ENABLED` | `1` | Set to `0` to skip enrichment |
 | `OLLAMA_HOST` / `OLLAMA_MODEL` | `http://localhost:11434` / `qwen3:4b` | Enrichment backend |
-| `OLLAMA_NUM_CTX` | `8192` | Context window; must hold transcript + prompt + output |
-| `LLM_MAX_INPUT_WORDS` | `5000` | Transcript words sent to the model; longer input is truncated |
+| `OLLAMA_NUM_CTX` | `32768` | Context window; must hold transcript + prompt + output |
+| `LLM_MAX_INPUT_WORDS` | `25000` | Transcript words sent to the model; longer input is truncated |
+| `REWRITE_ENABLED` | `1` | Set to `0` to skip the article rewrite stage |
+| `REWRITE_MODEL` | `gemma4:e4b` | Rewrite backend; independent of `OLLAMA_MODEL` on purpose |
+| `REWRITE_CHUNK_WORDS` | `900` | Source words per LLM call (chapters can force smaller chunks) |
+| `REWRITE_CONTEXT_WORDS` | `100` | Previous chunk's output replayed so seams flow |
+| `REWRITE_MIN_RATIO` / `REWRITE_MAX_RATIO` | `0.55` / `1.60` | Accepted output/input word ratio band |
+| `REWRITE_MIN_RETENTION` | `0.72` | Fraction of distinctive content words that must survive |
 
 The storage defaults match the original author's machine — override
 `BLOB_OUTPUT_DIR` and `CLEAN_OUTPUT_DIR` for your own layout.
@@ -296,11 +353,18 @@ The storage defaults match the original author's machine — override
   scrape_failures.jsonl                            # per-failure records with cause
 
 <BLOB_OUTPUT_DIR>/                                 # human review buffer
-  <Channel>/<Title>.md                             # cleaned, then enriched in place
+  <Channel>/<Title>.md                             # article (rewritten, then enriched)
+  <Channel>/<Title>.transcript.md                  # verbatim cleaned transcript
 
 /srv/dbdata/markdowns/yt_transcripts_structured/   # production
-  <Channel>/<Title>.md                             # approved transcript
+  <Channel>/<Title>.md                             # approved article
+  <Channel>/<Title>.transcript.md                  # approved verbatim transcript
 ```
+
+The article is LLM-generated prose, so the verbatim transcript stays beside it
+as the citation and embedding anchor — never rely on the article alone as the
+record of what was said. Both files carry the same `url:` in frontmatter, but
+only the article owns `videos.clean_path`.
 
 PostgreSQL tables:
 
@@ -322,8 +386,9 @@ python -m unittest discover -s tests -p 'test_*.py'
 The suite is offline and deterministic — no YouTube, Ollama, PostgreSQL, or
 production storage is touched. It covers transcript parsing across all supported
 paste formats, video ID and date validation, output-path confinement, duplicate
-rejection, job locking and SSE status, Run All stop-on-failure, stage exit
-codes, and the idempotent clean/ingest recovery paths.
+rejection, per-class job admission, SSE reattachment and replay, Run All
+stop-on-failure, stage exit codes, and the idempotent clean/ingest recovery
+paths.
 
 ---
 
@@ -333,16 +398,28 @@ codes, and the idempotent clean/ingest recovery paths.
   run looks healthy until the transcript itself fails. Backoff and the circuit
   breaker keep you from making it worse, but the only real fixes are waiting,
   a residential proxy, or the manual paste fallback.
-- **Enrichment input is capped** at `LLM_MAX_INPUT_WORDS` (5000). Longer
-  transcripts are truncated; map-reduce over chunks is not implemented yet.
+- **Enrichment input is capped** at `LLM_MAX_INPUT_WORDS` (25000). Longer
+  transcripts are truncated, so a multi-hour video still gets metadata derived
+  from part of its text. `rewrite` has no such cap — deriving enrichment from
+  the rewritten chunks instead would remove it entirely.
+- **Rewriting is slow and RAM-bound.** It generates roughly one token per
+  transcript token. Throughput collapses when the model does not fit in free
+  memory: measured on a 4 GB GPU / 32 GB host, the same model ran ~6 tok/s with
+  RAM free and ~1.5 tok/s while swapping. Check free memory before a long run —
+  it is worth about 4x.
+- **The rewrite stage has no web UI button.** CLI only for now.
 - **Enrichment requires PostgreSQL** — the queue lives there. Without
   `DATABASE_URL` the file pipeline still works, but nothing is tracked or
   queued.
 - **Ollama is not managed by this project.** If the server is not running,
   `enrich` fails fast and the rest of the pipeline continues without LLM
   metadata.
-- **One job at a time in the web UI.** There is no queue: a second request while
-  a job runs is rejected with HTTP 409.
+- **One pipeline job at a time in the web UI.** There is no queue: a second
+  pipeline request while one runs is rejected with HTTP 409. Manual transcript
+  adds are a separate class and are always admitted.
+- **A failing video is retried forever.** The enrichment queue includes 'failed'
+  rows with no attempt cap and no backoff, oldest first, so a permanently broken
+  video is re-attempted at the head of every run.
 - **The web UI has no authentication.** Bind it to localhost; do not expose it.
 - **File paths are derived from channel + title.** Two different videos that
   sanitize to the same path are rejected rather than merged or renamed, so you
@@ -378,7 +455,9 @@ codes, and the idempotent clean/ingest recovery paths.
 - [x] Manual transcript paste (CLI + web UI) for when YouTube blocks fetching
 - [x] Optional proxy / cookie support for transcript fetching
 - [x] Explicit stage outcomes + idempotent clean/ingest recovery
+- [x] Lossless article rewrite stage (chunked, coverage-guarded)
 - [ ] Map-reduce enrichment for long transcripts (remove input cap)
+- [ ] Web UI button + Run All wiring for the rewrite stage
 - [ ] `embed` command — chunk clean transcripts → Qdrant/Chroma
 - [ ] Semantic search CLI
 - [ ] Graph view of related content

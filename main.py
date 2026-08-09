@@ -24,12 +24,14 @@ Examples:
 import argparse
 import csv
 import datetime as dt
+import fcntl
 import json
 import logging
 import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
@@ -37,7 +39,7 @@ load_dotenv()
 
 import config
 from database import db
-from scraper import cleaner, formatter, llm_processor, manual, resolver, transcript
+from scraper import cleaner, formatter, llm_processor, manual, resolver, rewriter, transcript
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +49,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _CSV_COLUMNS = ["video_id", "title", "channel", "published", "url", "word_count", "md_path"]
+
+# ── Aggregate file lock ───────────────────────────────────────────────────
+# dataset.jsonl records reach ~800 KB — far above PIPE_BUF — so an append is
+# not atomic against a concurrent reader, which can observe a torn line. The
+# web UI runs a manual add (writer) alongside a long enrich (reader), and the
+# CLI can run beside the server, so this is a *file* lock: it holds across
+# processes, not just threads.
+#
+# flock() is per open-file-description: never nest these calls, or a shared
+# holder waiting on the exclusive lock deadlocks against itself.
+
+_AGGREGATE_LOCK_FILE = ".dataset.lock"
+
+
+@contextmanager
+def aggregate_lock(output_dir: str, *, exclusive: bool):
+    """Serialize dataset.jsonl / index.csv access across threads and processes."""
+    os.makedirs(output_dir, exist_ok=True)
+    fd = os.open(
+        os.path.join(output_dir, _AGGREGATE_LOCK_FILE),
+        os.O_RDWR | os.O_CREAT,
+        0o644,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)  # releases the lock
+
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────
@@ -60,24 +91,23 @@ def _output_paths(base_dir: str, meta: dict) -> tuple[str, str]:
 def _write_local_aggregate(records: list[dict], output_dir: str, no_jsonl: bool, no_csv: bool) -> None:
     if not records:
         return
-    os.makedirs(output_dir, exist_ok=True)
+    with aggregate_lock(output_dir, exclusive=True):
+        if not no_jsonl:
+            path = os.path.join(output_dir, "dataset.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            logger.info("Appended %d record(s) to %s", len(records), path)
 
-    if not no_jsonl:
-        path = os.path.join(output_dir, "dataset.jsonl")
-        with open(path, "a", encoding="utf-8") as f:
-            for rec in records:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        logger.info("Appended %d record(s) to %s", len(records), path)
-
-    if not no_csv:
-        path = os.path.join(output_dir, "index.csv")
-        is_new = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
-            if is_new:
-                writer.writeheader()
-            writer.writerows(records)
-        logger.info("Appended %d row(s) to %s", len(records), path)
+        if not no_csv:
+            path = os.path.join(output_dir, "index.csv")
+            is_new = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
+                if is_new:
+                    writer.writeheader()
+                writer.writerows(records)
+            logger.info("Appended %d row(s) to %s", len(records), path)
 
 
 def _db_available() -> bool:
@@ -90,7 +120,7 @@ def _find_staged_record(output_dir: str, video_id: str) -> dict | None:
     if not os.path.exists(path):
         return None
 
-    with open(path, encoding="utf-8") as f:
+    with aggregate_lock(output_dir, exclusive=False), open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -408,6 +438,23 @@ def _blob_path_for(blob_dir: str, meta: dict) -> tuple[str, str]:
     return channel_dir, os.path.join(channel_dir, f"{stem}.md")
 
 
+_TRANSCRIPT_SUFFIX = ".transcript.md"
+
+
+def _transcript_path(blob_path: str) -> str:
+    """
+    Verbatim companion beside the article: <stem>.transcript.md.
+
+    The article is LLM-generated prose; this file is the unmodified cleaned
+    transcript it was derived from, kept as the citation and embedding anchor.
+    """
+    return blob_path[: -len(".md")] + _TRANSCRIPT_SUFFIX
+
+
+def _is_transcript_companion(path: str) -> bool:
+    return path.endswith(_TRANSCRIPT_SUFFIX)
+
+
 def _sections_with_timestamps(sections: list[dict], chapters: list[dict]) -> list[dict]:
     """
     Attach real timestamps to LLM sections when the video's chapter count
@@ -478,7 +525,7 @@ def cmd_clean(args: argparse.Namespace) -> bool:
     logger.info("Reading from %s", jsonl_path)
     logger.info("Cleaned output → %s  (blob storage for review)", blob_dir)
 
-    with open(jsonl_path, encoding="utf-8") as f:
+    with aggregate_lock(raw_dir, exclusive=False), open(jsonl_path, encoding="utf-8") as f:
         records = [json.loads(line) for line in f if line.strip()]
 
     saved, skipped, filtered, queued, errors = 0, 0, 0, 0, 0
@@ -528,6 +575,15 @@ def cmd_clean(args: argparse.Namespace) -> bool:
             logger.info("Cleaned → %s", blob_path)
             saved += 1
 
+        # The verbatim companion is cheap and is the only ground truth once the
+        # rewrite stage replaces blob_path with generated prose. Written even
+        # when the blob already exists, so older runs gain one on re-clean.
+        transcript_path = _transcript_path(blob_path)
+        if not os.path.exists(transcript_path):
+            os.makedirs(channel_dir, exist_ok=True)
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                f.write(formatter.to_transcript_doc(meta, cleaned_text))
+
         if db_available:
             persisted, is_queued = _persist_clean_row(
                 meta, cleaned_text, requeue=not blob_exists,
@@ -553,7 +609,7 @@ def _load_records_index(raw_dir: str) -> dict:
     jsonl_path = os.path.join(raw_dir, "dataset.jsonl")
     index: dict = {}
     if os.path.exists(jsonl_path):
-        with open(jsonl_path, encoding="utf-8") as f:
+        with aggregate_lock(raw_dir, exclusive=False), open(jsonl_path, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     rec = json.loads(line)
@@ -574,7 +630,14 @@ def _enrich_one(video_id: str, rec: dict, blob_dir: str) -> str:
         db.set_enrichment_status(video_id, "done")  # nothing to enrich
         return "no-prose"
 
-    result = llm_processor.enrich(meta["title"], cleaned_text, chapters)
+    # Prefer the rewritten article when the rewrite stage has already run: it is
+    # better prose than the caption text, so it yields better metadata — and
+    # reading it back means enrichment never clobbers it.
+    channel_dir, blob_path = _blob_path_for(blob_dir, meta)
+    article_body = _read_article_body(blob_path)
+    source_text = article_body or cleaned_text
+
+    result = llm_processor.enrich(meta["title"], source_text, chapters)
 
     try:
         db.record_processing_run(
@@ -602,15 +665,153 @@ def _enrich_one(video_id: str, rec: dict, blob_dir: str) -> str:
         _sections_with_timestamps(enrichment.get("sections") or [], chapters),
     )
 
-    # Both persisted metadata and the knowledge document are required before
-    # the row leaves the retry queue.
-    channel_dir, blob_path = _blob_path_for(blob_dir, meta)
+    # Both persisted metadata and the output document are required before the
+    # row leaves the retry queue.
     os.makedirs(channel_dir, exist_ok=True)
     with open(blob_path, "w", encoding="utf-8") as f:
-        f.write(formatter.to_knowledge_doc(meta, cleaned_text, enrichment))
+        if article_body:
+            f.write(formatter.to_article_doc(meta, article_body, enrichment))
+        else:
+            f.write(formatter.to_knowledge_doc(meta, cleaned_text, enrichment))
 
     db.set_enrichment_status(video_id, "done")
     return "done"
+
+
+def _read_article_body(blob_path: str) -> str | None:
+    """Recover rewritten prose from an existing blob, if the rewrite stage ran."""
+    try:
+        with open(blob_path, encoding="utf-8") as f:
+            return formatter.extract_article_body(f.read())
+    except OSError:
+        return None
+
+
+# ── rewrite (background worker) ────────────────────────────────────────────
+
+def _rewrite_one(video_id: str, rec: dict, blob_dir: str) -> str:
+    """
+    Rewrite one video's transcript into an article and write it to blob storage.
+
+    Writes the verbatim companion first, so the ground truth is on disk before
+    any generated prose replaces the readable file. Returns an outcome string.
+    """
+    meta = _meta_from_record(rec)
+    chapters = rec.get("chapters") or []
+    cleaned_text = cleaner.clean(rec.get("transcript_segments", []), chapters=chapters)
+    if cleaned_text is None:
+        db.set_rewrite_status(video_id, "done")  # nothing to rewrite
+        return "no-prose"
+
+    channel_dir, blob_path = _blob_path_for(blob_dir, meta)
+    os.makedirs(channel_dir, exist_ok=True)
+
+    transcript_path = _transcript_path(blob_path)
+    if not os.path.exists(transcript_path):
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(formatter.to_transcript_doc(meta, cleaned_text))
+
+    result = rewriter.rewrite(cleaned_text, meta["title"])
+
+    try:
+        db.record_processing_run(
+            video_id, result.model,
+            "success" if result.ok else "failed",
+            result.error, result.duration_ms,
+        )
+    except Exception as exc:
+        logger.warning("Run log failed for %s: %s", video_id, exc)
+
+    if not result.ok or result.article is None:
+        db.set_rewrite_status(video_id, "failed")
+        return "failed"
+
+    # Preserve any enrichment already on the file so re-running rewrite after
+    # enrich doesn't strip the metadata back off.
+    with open(blob_path, "w", encoding="utf-8") as f:
+        f.write(formatter.to_article_doc(meta, result.article))
+
+    db.set_rewrite_status(video_id, "done")
+    # A new article invalidates metadata derived from the old text.
+    db.set_enrichment_status(video_id, "pending")
+    return "done"
+
+
+def cmd_rewrite(args: argparse.Namespace) -> bool:
+    """
+    Drain the rewrite queue: turn cleaned transcripts into readable articles.
+
+    This is by far the slowest stage — it generates roughly one token per token
+    of transcript — so it is a separate resumable worker like `enrich`. Each
+    video is marked done as it finishes, making interruption safe.
+    """
+    if not _db_available():
+        logger.error("rewrite needs DATABASE_URL — it reads the queue from PostgreSQL.")
+        return False
+    if not config.REWRITE_ENABLED:
+        logger.error("REWRITE_ENABLED=0 — nothing to do. Set it to 1 in .env to rewrite.")
+        return False
+    if not rewriter.is_available():
+        logger.error("Ollama is not reachable at %s — start it and retry.",
+                     config.OLLAMA_HOST)
+        return False
+
+    logger.info("Rewrite worker — model: %s, ~%d words/chunk",
+                config.REWRITE_MODEL, config.REWRITE_CHUNK_WORDS)
+
+    processed, failures = 0, 0
+    while True:
+        records = _load_records_index(args.raw_dir)
+        pending = db.list_pending_rewrite(limit=args.limit or None)
+
+        if not pending:
+            if not args.loop:
+                break
+            time.sleep(args.poll)
+            continue
+
+        logger.info("%d video(s) queued for rewrite.", len(pending))
+        for video_id in pending:
+            rec = records.get(video_id)
+            if rec is None:
+                logger.warning("No staged record for %s — marking failed.", video_id)
+                db.set_rewrite_status(video_id, "failed")
+                failures += 1
+                continue
+            try:
+                outcome = _rewrite_one(video_id, rec, args.blob_dir)
+            except Exception as exc:
+                logger.error("Rewrite failed for %s: %s", video_id, exc)
+                db.set_rewrite_status(video_id, "failed")
+                failures += 1
+                continue
+            processed += 1
+            if outcome == "failed":
+                failures += 1
+
+        if args.limit or not args.loop:
+            break
+
+    logger.info("Rewrite worker done. %d processed, %d failed.", processed, failures)
+    if failures:
+        logger.warning("%d video(s) left queued for retry.", failures)
+    return True
+
+
+def _enrich_summary(processed: int, failures: int) -> bool:
+    """
+    Report a finished run. Individual video failures are queue state, not run
+    failure: those rows stay 'failed' in PostgreSQL and the next run retries
+    them. Returning False here aborted every downstream run-all stage, so with
+    a >50% per-video timeout rate ingest effectively never ran.
+    """
+    logger.info("Enrich worker done. %d processed, %d failed.", processed, failures)
+    if failures:
+        logger.warning(
+            "%d video(s) left queued for retry — run enrich again to pick them up.",
+            failures,
+        )
+    return True
 
 
 def cmd_enrich(args: argparse.Namespace) -> bool:
@@ -672,14 +873,12 @@ def cmd_enrich(args: argparse.Namespace) -> bool:
             processed += 1
             if args.limit and processed >= args.limit:
                 logger.info("Reached --limit %d.", args.limit)
-                logger.info("Enrich worker done. %d processed.", processed)
-                return failures == 0
+                return _enrich_summary(processed, failures)
 
         if not args.loop:
             break
 
-    logger.info("Enrich worker done. %d processed.", processed)
-    return failures == 0
+    return _enrich_summary(processed, failures)
 
 
 # ── benchmark ─────────────────────────────────────────────────────────────
@@ -874,7 +1073,10 @@ def cmd_ingest(args: argparse.Namespace) -> bool:
                     updates = {}
                     if status in {"raw", "cleaned"}:
                         updates["status"] = "ingested"
-                    if current.get("clean_path") != dst:
+                    # Both the article and its verbatim companion carry the same
+                    # video_id, so only the article may own clean_path — otherwise
+                    # the column flip-flops with os.walk ordering.
+                    if not _is_transcript_companion(src) and current.get("clean_path") != dst:
                         updates["clean_path"] = dst
                     if updates:
                         db.update_video(video_id, updates)
@@ -998,6 +1200,14 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--loop",  action="store_true", help="Keep polling for new work instead of exiting")
     ep.add_argument("--poll",  type=int, default=60, help="Seconds between polls in --loop mode")
 
+    # rewrite
+    rp = sub.add_parser("rewrite", help="Rewrite cleaned transcripts into readable articles (resumable)")
+    rp.add_argument("--raw-dir",  default=config.LOCAL_OUTPUT_DIR)
+    rp.add_argument("--blob-dir", default=config.BLOB_OUTPUT_DIR)
+    rp.add_argument("--limit", type=int, default=0, help="Max videos to rewrite this run (0 = all pending)")
+    rp.add_argument("--loop",  action="store_true", help="Keep polling for new work instead of exiting")
+    rp.add_argument("--poll",  type=int, default=60, help="Seconds between polls in --loop mode")
+
     # benchmark
     bp = sub.add_parser("benchmark", help="Compare models on the same transcript (speed + output)")
     bp.add_argument("--models", help="Comma-separated Ollama model tags (default: OLLAMA_MODEL)")
@@ -1024,6 +1234,7 @@ def main() -> None:
         "scrape":    cmd_scrape,
         "manual":    cmd_manual,
         "clean":     cmd_clean,
+        "rewrite":   cmd_rewrite,
         "enrich":    cmd_enrich,
         "benchmark": cmd_benchmark,
         "ingest":    cmd_ingest,

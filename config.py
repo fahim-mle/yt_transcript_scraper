@@ -57,23 +57,58 @@ YT_COOKIE_FILE = os.getenv("YT_COOKIE_FILE", "")
 # ── Cleaning pipeline ──────────────────────────────────────────────────────
 MIN_WORD_COUNT = 200        # reject transcripts shorter than this after cleaning
 PARAGRAPH_MIN_WORDS = 60    # minimum words before a paragraph break is allowed
-PARAGRAPH_GAP_SECONDS = 2.0 # silence gap that forces a paragraph break
+PARAGRAPH_GAP_SECONDS = 2.0  # silence gap that forces a paragraph break
 
 # ── LLM enrichment (clean stage) ───────────────────────────────────────────
 # Content metadata (summary, key concepts, domains, difficulty, sections) is
 # derived from the cleaned transcript by a local Ollama model during `clean`.
 # Set LLM_ENABLED=0 to skip enrichment and produce plain clean .md files.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 LLM_ENABLED = os.getenv("LLM_ENABLED", "1") == "1"
 # Context window for the model. Must comfortably hold the capped transcript
 # (~1.3 tokens/word) plus prompt and JSON output, or the input gets truncated.
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
-# Cap prose sent to the model. ~5000 words ≈ 6500 tokens, leaving room in an
-# 8192 context for the prompt and structured output. Longer transcripts are
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "32768"))
+# Cap prose sent to the model. ~25000 words ≈ 32500 tokens, leaving room in an
+# 32768 context for the prompt and structured output. Longer transcripts are
 # truncated (a map-reduce pass over chunks is a future improvement).
-LLM_MAX_INPUT_WORDS = int(os.getenv("LLM_MAX_INPUT_WORDS", "5000"))
+LLM_MAX_INPUT_WORDS = int(os.getenv("LLM_MAX_INPUT_WORDS", "25000"))
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "600"))
+
+# ── Article rewrite (rewrite stage) ────────────────────────────────────────
+# Turns cleaned caption prose into a readable article. Unlike enrichment this
+# is a *lossless* transform: every chunk is rewritten, never summarised, and a
+# coverage guard rejects output that dropped content (see scraper/rewriter.py).
+REWRITE_ENABLED = os.getenv("REWRITE_ENABLED", "1") == "1"
+# Deliberately independent of OLLAMA_MODEL: rewriting rewards a strong writer,
+# enrichment only needs a competent JSON filler. Running a bigger model here
+# and a faster one for enrichment is the intended split.
+REWRITE_MODEL = os.getenv("REWRITE_MODEL", "gemma4:e4b")
+# Words of source prose per LLM call. Chunks break on paragraph and chapter
+# boundaries, so the real size varies around this. Small chunks keep the KV
+# cache short (decode stays fast) and keep the model from drifting into
+# summarising, which is what long one-shot rewrites degrade into.
+REWRITE_CHUNK_WORDS = int(os.getenv("REWRITE_CHUNK_WORDS", "900"))
+# Words of the previous chunk's *output* replayed as context, so prose flows
+# across seams instead of restarting each chunk. This is context only — the
+# model is told to continue from it, not to rewrite it — so nothing is
+# duplicated in the article. Overlapping the *source* instead would rewrite the
+# same sentences twice and put them in the output twice.
+REWRITE_CONTEXT_WORDS = int(os.getenv("REWRITE_CONTEXT_WORDS", "100"))
+# A chunk plus prompt and output fits in ~3k tokens; 8192 is comfortable.
+REWRITE_NUM_CTX = int(os.getenv("REWRITE_NUM_CTX", "8192"))
+REWRITE_TIMEOUT_SECONDS = int(os.getenv("REWRITE_TIMEOUT_SECONDS", "900"))
+# ── Coverage guard ──
+# Output/input word ratio must land in this band. Below the floor means the
+# model summarised; above the ceiling means it padded or hallucinated.
+REWRITE_MIN_RATIO = float(os.getenv("REWRITE_MIN_RATIO", "0.55"))
+REWRITE_MAX_RATIO = float(os.getenv("REWRITE_MAX_RATIO", "1.60"))
+# Fraction of the chunk's distinctive content words that must survive. This is
+# the check that actually enforces "covers every point" — ratio alone passes a
+# fluent paraphrase that quietly dropped a third of the material.
+REWRITE_MIN_RETENTION = float(os.getenv("REWRITE_MIN_RETENTION", "0.72"))
+# Retries at lower temperature before falling back to the verbatim chunk.
+REWRITE_MAX_ATTEMPTS = int(os.getenv("REWRITE_MAX_ATTEMPTS", "2"))
 
 # ── Database ───────────────────────────────────────────────────────────────
 # Set DATABASE_URL in your .env file, e.g.:
