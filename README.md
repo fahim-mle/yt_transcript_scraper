@@ -366,6 +366,32 @@ as the citation and embedding anchor — never rely on the article alone as the
 record of what was said. Both files carry the same `url:` in frontmatter, but
 only the article owns `videos.clean_path`.
 
+### Frontmatter dates
+
+Every document carries two independent dates:
+
+| Field | Meaning |
+|---|---|
+| `published` | When the video went up on YouTube. A fact about the video. |
+| `created_at` | When the video entered *your* knowledge base. ISO 8601 with offset. |
+
+`created_at` is what tells you a transcript is due for a re-scrape. A video about
+a fast-moving tool may be accurate the week you capture it and obsolete a few
+months later, and its publish date never changes to warn you — so staleness is
+measured on the capture clock, not the publish clock.
+
+It is stamped once, when the video first enters `dataset.jsonl`, and every later
+stage reads it back rather than re-stamping. That keeps `clean`, `rewrite` and
+`enrich` idempotent: regenerating a document never changes its frontmatter.
+
+Videos staged before this field existed simply omit it — a missing stamp is left
+missing rather than invented. To backfill from the real scrape times already in
+PostgreSQL:
+
+```sql
+SELECT video_id, created_at FROM videos ORDER BY created_at;
+```
+
 PostgreSQL tables:
 
 - **`videos`** — one row per video: bibliographic metadata plus LLM-derived

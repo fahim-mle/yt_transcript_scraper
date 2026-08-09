@@ -50,6 +50,12 @@ The article is generated text, so it must never become the only record. `clean` 
 
 The blob file is therefore written twice: `formatter.to_clean_markdown` at clean time, overwritten by `formatter.to_knowledge_doc` at enrich time.
 
+### `created_at` is stamped once, at the source
+
+`published` is a fact about the video; `created_at` is when it entered the knowledge base, and it's the clock staleness is measured on. `formatter.to_jsonl_record` stamps it when a video first reaches `dataset.jsonl` — every later stage reads it back through `_meta_from_record` rather than re-stamping. **Never regenerate it at render time**: `clean`, `rewrite` and `enrich` each rewrite the document, so a `now()` there would churn the frontmatter on every run and break their idempotency. Records staged before the field existed omit it; `_frontmatter_lines` leaves a missing stamp missing rather than inventing one.
+
+All five document builders route through `_frontmatter_lines`, so a new frontmatter field is added in exactly one place.
+
 ### Frontmatter `url:` is load-bearing
 
 Before overwriting any existing blob or ingest destination, `_extract_video_id` parses the video ID out of the file's YAML `url:` field and rejects the write on mismatch — a path collision is never silently repointed. Changing the frontmatter shape in `scraper/formatter.py` breaks the clean and ingest recovery paths.

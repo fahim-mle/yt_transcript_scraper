@@ -428,7 +428,8 @@ def _report_failures(failures: list[dict], output_dir: str) -> None:
 
 def _meta_from_record(rec: dict) -> dict:
     return {k: rec.get(k, "") for k in
-            ("video_id", "url", "title", "channel", "published", "description")}
+            ("video_id", "url", "title", "channel", "published", "description",
+             "created_at")}
 
 
 def _blob_path_for(blob_dir: str, meta: dict) -> tuple[str, str]:

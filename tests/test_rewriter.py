@@ -265,6 +265,62 @@ class ArticleDocTests(unittest.TestCase):
         self.assertIsNone(formatter.extract_article_body(doc))
 
 
+class CreatedAtTests(unittest.TestCase):
+    """
+    `created_at` records when a video entered the knowledge base, which is what
+    goes stale — `published` is a fact about the video and never changes.
+    """
+
+    META = {"title": "T", "channel": "C", "published": "2026-01-01",
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "description": ""}
+    SEGMENTS = [{"text": "hello there", "start": 0.0, "duration": 1.0}]
+
+    def test_new_records_are_stamped(self):
+        rec = formatter.to_jsonl_record(self.META, self.SEGMENTS, "/tmp/x.md")
+        self.assertTrue(rec["created_at"])
+        # date -Iseconds shape: 2026-08-09T13:57:27+10:00
+        self.assertRegex(rec["created_at"],
+                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
+
+    def test_an_existing_stamp_is_never_overwritten(self):
+        meta = {**self.META, "created_at": "2020-01-01T00:00:00+00:00"}
+        rec = formatter.to_jsonl_record(meta, self.SEGMENTS, "/tmp/x.md")
+        self.assertEqual(rec["created_at"], "2020-01-01T00:00:00+00:00")
+
+    def test_it_reaches_every_document_type(self):
+        meta = {**self.META, "created_at": "2026-08-09T13:00:00+10:00"}
+        enrichment = {"summary": "S", "key_concepts": [], "domains": [],
+                      "difficulty": "beginner", "content_kind": "talk", "sections": []}
+        for doc in (formatter.to_clean_markdown(meta, "body"),
+                    formatter.to_transcript_doc(meta, "body"),
+                    formatter.to_article_doc(meta, "body"),
+                    formatter.to_article_doc(meta, "body", enrichment),
+                    formatter.to_knowledge_doc(meta, "body", enrichment)):
+            self.assertIn('created_at: "2026-08-09T13:00:00+10:00"', doc)
+
+    def test_it_is_distinct_from_published(self):
+        meta = {**self.META, "created_at": "2026-08-09T13:00:00+10:00"}
+        doc = formatter.to_clean_markdown(meta, "body")
+        self.assertIn('published: "2026-01-01"', doc)
+        self.assertIn('created_at: "2026-08-09T13:00:00+10:00"', doc)
+
+    def test_records_staged_before_the_field_existed_omit_it(self):
+        doc = formatter.to_clean_markdown(self.META, "body")
+        self.assertNotIn("created_at", doc,
+                         "a missing stamp must be omitted, never invented")
+
+    def test_rendering_twice_does_not_change_the_stamp(self):
+        # clean/rewrite/enrich each rewrite the document; the stamp must not drift.
+        meta = {**self.META, "created_at": "2026-08-09T13:00:00+10:00"}
+        self.assertEqual(formatter.to_clean_markdown(meta, "body"),
+                         formatter.to_clean_markdown(meta, "body"))
+
+    def test_it_survives_the_record_to_metadata_hop(self):
+        import main
+        rec = formatter.to_jsonl_record(self.META, self.SEGMENTS, "/tmp/x.md")
+        self.assertEqual(main._meta_from_record(rec)["created_at"], rec["created_at"])
+
+
 class CompanionPathTests(unittest.TestCase):
     def test_transcript_path_is_derived_from_the_article_path(self):
         import main
