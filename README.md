@@ -153,10 +153,15 @@ streams live into the log panel.
 | Button | What it runs |
 |---|---|
 | **Scrape** | Fetches transcripts + metadata for the URL in the box |
-| **Clean** | Merges segments into paragraphs, writes `.md` to blob storage, queues enrichment |
+| **Clean** | Merges segments into paragraphs, writes `.md` to blob storage, queues rewrite and enrichment |
+| **Rewrite** | Drains the rewrite queue, turning transcripts into articles at lowest CPU priority |
 | **Enrich** | Drains the enrichment queue with the local LLM at lowest CPU priority |
 | **Ingest** | Copies reviewed `.md` files into production storage |
-| **Run All** | scrape → clean → enrich → ingest in one job (scrape only when a URL is in the box) |
+| **Run All** | scrape → clean → rewrite → enrich → ingest in one job (scrape only when a URL is in the box) |
+
+**Run All is long.** Rewriting dominates it — hours per long video. Both LLM
+stages are skippable with `REWRITE_ENABLED=0` and `LLM_ENABLED=0`, and the label
+on the job reflects whichever stages are actually enabled.
 
 Pipeline jobs are single-flight: the pipeline buttons disable themselves while
 one is in flight, and a second concurrent submission is rejected with HTTP 409.
@@ -291,9 +296,12 @@ It is **lossless by design** — the opposite of summarising:
 
 Rewriting is the slowest thing this project does: it generates roughly one token
 per transcript token. Budget hours per long video, and run it overnight or from
-cron like `enrich`. It is resumable, so interrupting it is always safe.
+cron like `enrich`. It is resumable, so interrupting it is always safe — closing
+the web UI or Ctrl+C on the CLI loses nothing.
 
-Currently CLI-only — there is no web UI button for it yet.
+In the web UI it is the **Rewrite** button, and it runs inside **Run All**
+between clean and enrich. That order is required: enrich derives its metadata
+from the rewritten article, so rewriting has to happen first.
 
 ### Choosing a model
 
@@ -433,7 +441,8 @@ paths.
   memory: measured on a 4 GB GPU / 32 GB host, the same model ran ~6 tok/s with
   RAM free and ~1.5 tok/s while swapping. Check free memory before a long run —
   it is worth about 4x.
-- **The rewrite stage has no web UI button.** CLI only for now.
+- **Run All now includes rewriting**, which makes it a multi-hour job on a real
+  backlog. Set `REWRITE_ENABLED=0` if you want the old fast path.
 - **Enrichment requires PostgreSQL** — the queue lives there. Without
   `DATABASE_URL` the file pipeline still works, but nothing is tracked or
   queued.
@@ -482,8 +491,8 @@ paths.
 - [x] Optional proxy / cookie support for transcript fetching
 - [x] Explicit stage outcomes + idempotent clean/ingest recovery
 - [x] Lossless article rewrite stage (chunked, coverage-guarded)
+- [x] Web UI button + Run All wiring for the rewrite stage
 - [ ] Map-reduce enrichment for long transcripts (remove input cap)
-- [ ] Web UI button + Run All wiring for the rewrite stage
 - [ ] `embed` command — chunk clean transcripts → Qdrant/Chroma
 - [ ] Semantic search CLI
 - [ ] Graph view of related content

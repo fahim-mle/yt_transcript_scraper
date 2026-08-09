@@ -76,6 +76,8 @@ The file pipeline (`scrape`/`manual`/`clean`/`ingest`) degrades gracefully witho
 
 Two admission classes: `HEAVY` (all pipeline stages, single-flight — a second request gets HTTP 409) and `LIGHT` (manual transcript add). That split is why pasting a transcript works during a multi-hour **Run All**.
 
+Run All order is `scrape → clean → rewrite → enrich → ingest`, with `rewrite` gated on `REWRITE_ENABLED` and `enrich` on `LLM_ENABLED`. **Rewrite must stay before enrich** — enrich reads the article body back out of the blob. When adding a stage here, patch its `cmd_*` in every run-all test: an unpatched LLM stage makes the offline suite call a real model and hang.
+
 Log streaming is replayable: every line carries a monotonic sequence number, `_Job.subscribe(after)` atomically snapshots the backlog and registers for live lines, and finished jobs are retained (`_MAX_JOBS = 20`) so a page reload after completion replays rather than reporting a phantom failure. Reattachment is driven by the `Last-Event-ID` header.
 
 Job output is captured via a `logging.Handler` plus a thread-ident → job-id map (`_thread_job_map`). **Stages must emit progress through `logging`, not `print`**, or it never reaches the UI. Enrichment jobs call `_low_priority()` (`os.nice(19)`, per-thread on Linux) so the server stays responsive.

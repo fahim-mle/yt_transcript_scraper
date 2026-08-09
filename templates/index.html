@@ -375,10 +375,12 @@
       </div>
       <div class="stage-row">
         <button class="btn btn-secondary" id="btn-clean"  onclick="runStage('clean')">Clean</button>
+        <button class="btn btn-secondary" id="btn-rewrite" onclick="runStage('rewrite')"
+                title="Rewrites cleaned transcripts into readable articles. Slow — hours for a long video. Resumable, so closing this page does not lose progress.">Rewrite</button>
         <button class="btn btn-secondary" id="btn-enrich" onclick="runStage('enrich')">Enrich</button>
         <button class="btn btn-secondary" id="btn-ingest" onclick="runStage('ingest')">Ingest</button>
         <button class="btn btn-primary"   id="btn-runall" onclick="runAll()"
-                title="Runs clean → enrich → ingest back to back (scrape first if a URL is in the box)">Run All</button>
+                title="Runs clean → rewrite → enrich → ingest back to back (scrape first if a URL is in the box)">Run All</button>
         <div id="job-indicator">
           <div class="spinner"></div>
           <span id="job-label">running…</span>
@@ -468,8 +470,16 @@
 <div id="error-toast"></div>
 
 <script>
-  let _es = null;
-  let _running = false;
+  // Job state is owned by the server. /api/status is polled and is the only
+  // thing that decides whether a button is disabled; SSE carries log lines
+  // only. That split is what makes a page reload — or a dropped stream —
+  // recover instead of showing a phantom failure.
+  const POLL_MS = 3000;
+  const DETACH_GRACE_MS = 6000;   // don't drop a stream a poll hasn't seen yet
+
+  const _streams = {};            // job id → {es, label, since, onSuccess}
+  let _busy = {heavy: null, light: null};
+  let _logPrimed = false;
 
   // ── Helpers ──────────────────────────────────────────────────────
 
@@ -479,25 +489,35 @@
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  function setRunning(on, label) {
-    _running = on;
-    ['btn-scrape','btn-clean','btn-enrich','btn-ingest','btn-runall','btn-manual'].forEach(id => {
-      document.getElementById(id).disabled = on;
+  const HEAVY_BUTTONS = ['btn-scrape','btn-clean','btn-rewrite','btn-enrich','btn-ingest','btn-runall'];
+
+  function applyBusy() {
+    HEAVY_BUTTONS.forEach(id => {
+      document.getElementById(id).disabled = !!_busy.heavy;
     });
-    const ind = document.getElementById('job-indicator');
-    ind.className = on ? 'visible' : '';
-    if (label) document.getElementById('job-label').textContent = label + '…';
+    // The manual add only ever waits on another manual add.
+    document.getElementById('btn-manual').disabled = !!_busy.light;
+
+    // The server owns the label; the client never invents a second name for
+    // the same job, so nothing changes under you when a poll lands.
+    const active = [_busy.heavy, _busy.light].filter(Boolean);
+    document.getElementById('job-indicator').className = active.length ? 'visible' : '';
+    document.getElementById('job-label').textContent =
+      active.length ? active.map(j => j.label).join(' + ') + '…' : '';
   }
 
-  function appendLog(text) {
+  function appendLog(text, label) {
     const el = document.getElementById('log-output');
+    if (!_logPrimed) { el.textContent = ''; _logPrimed = true; }
     const atBottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 8;
-    el.textContent += text + '\n';
+    const prefix = (label && Object.keys(_streams).length > 1) ? `[${label}] ` : '';
+    el.textContent += prefix + text + '\n';
     if (atBottom) el.scrollTop = el.scrollHeight;
   }
 
   function clearLog() {
     document.getElementById('log-output').textContent = '';
+    _logPrimed = true;
   }
 
   function showError(msg) {
@@ -507,52 +527,108 @@
     setTimeout(() => { t.style.display = 'none'; }, 4000);
   }
 
-  // ── SSE stream ───────────────────────────────────────────────────
+  // FastAPI reports validation problems as `detail`, our handlers as `error`.
+  // Missing both without a job_id still means the request went nowhere.
+  function apiError(d) {
+    if (!d || typeof d !== 'object') return 'Unexpected response from the server';
+    if (d.error) return d.error;
+    if (d.detail) {
+      if (typeof d.detail === 'string') return d.detail;
+      const first = Array.isArray(d.detail) ? d.detail[0] : null;
+      if (first && first.msg) {
+        const field = (first.loc || []).slice(1).join('.');
+        return field ? `${field}: ${first.msg}` : first.msg;
+      }
+      return JSON.stringify(d.detail);
+    }
+    return d.job_id ? null : 'Unexpected response from the server';
+  }
 
-  function streamJob(jobId, label, onSuccess = null) {
-    if (_es) _es.close();
-    clearLog();
-    setRunning(true, label);
+  // ── SSE streams ──────────────────────────────────────────────────
 
-    _es = new EventSource(`/api/jobs/${jobId}/stream`);
+  function attach(jobId, label, onSuccess) {
+    if (_streams[jobId]) return;
+    const es = new EventSource(`/api/jobs/${jobId}/stream`);
+    _streams[jobId] = {es, label, since: Date.now(), onSuccess};
 
-    _es.onmessage = e => appendLog(e.data);
+    es.onmessage = e => appendLog(e.data, label);
 
-    _es.addEventListener('done', e => {
+    es.addEventListener('done', e => {
       const succeeded = e.data === 'done';
-      _es.close();
-      setRunning(false);
-      if (succeeded && onSuccess) onSuccess();
+      const onDone = _streams[jobId] && _streams[jobId].onSuccess;
+      detach(jobId);
+      if (succeeded && onDone) onDone();
       if (!succeeded) showError(`${label} failed — check the log.`);
       loadVideos();
+      loadStatus();
     });
 
-    _es.onerror = () => {
-      _es.close();
-      setRunning(false);
-      appendLog('[Connection closed]');
-      loadVideos();
-    };
+    // Deliberately no onerror handler that touches job state: the browser
+    // reconnects on its own and the server replays from Last-Event-ID, so a
+    // blip is invisible. If the job really died, the next poll notices.
+  }
+
+  function detach(jobId) {
+    const stream = _streams[jobId];
+    if (!stream) return;
+    stream.es.close();
+    delete _streams[jobId];
+  }
+
+  // Reconcile local state with what the server says is running.
+  function syncJobs(jobs) {
+    const running = {heavy: null, light: null};
+    const live = new Set();
+    jobs.forEach(j => { running[j.class] = j; live.add(j.id); });
+    _busy = running;
+    applyBusy();
+
+    // Reattach after a reload, or pick up a job started from another tab.
+    jobs.forEach(j => attach(j.id, j.label));
+
+    const now = Date.now();
+    Object.keys(_streams).forEach(id => {
+      if (!live.has(id) && now - _streams[id].since > DETACH_GRACE_MS) detach(id);
+    });
   }
 
   // ── Actions ──────────────────────────────────────────────────────
 
-  function scrape() {
-    if (_running) return;
-    const url = document.getElementById('url-input').value.trim();
-    if (!url) { showError('Paste a YouTube URL first.'); return; }
-
-    fetch('/api/scrape', {
+  function post(path, body) {
+    return fetch(path, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url}),
-    })
-    .then(r => r.json())
-    .then(d => {
-      if (d.error) { showError(d.error); return; }
-      streamJob(d.job_id, 'scraping');
-    })
-    .catch(e => showError(String(e)));
+      body: JSON.stringify(body),
+    }).then(r => r.json().catch(() => ({error: `Server returned HTTP ${r.status}`})));
+  }
+
+  function start(path, body, klass, onSuccess) {
+    if (_busy[klass]) return;
+    post(path, body)
+      .then(d => {
+        const err = apiError(d);
+        if (err) { showError(err); return; }
+        if (!Object.keys(_streams).length) clearLog();
+        // Optimistic: don't wait up to POLL_MS to disable the buttons.
+        _busy[klass] = {id: d.job_id, label: d.label};
+        applyBusy();
+        attach(d.job_id, d.label, onSuccess);
+      })
+      .catch(e => showError(String(e)));
+  }
+
+  function scrape() {
+    const url = document.getElementById('url-input').value.trim();
+    if (!url) { showError('Paste a YouTube URL first.'); return; }
+    start('/api/scrape', {url}, 'heavy');
+  }
+
+  function runStage(stage) {
+    start(`/api/${stage}`, {}, 'heavy');
+  }
+
+  function runAll() {
+    start('/api/run-all', {url: document.getElementById('url-input').value.trim()}, 'heavy');
   }
 
   // ── Manual paste ─────────────────────────────────────────────────
@@ -567,63 +643,19 @@
   }
 
   function submitManual() {
-    if (_running) return;
     const val = id => document.getElementById(id).value.trim();
 
     if (!val('m-url'))        { showError('Video URL or ID is required'); return; }
     if (!val('m-transcript')) { showError('Transcript is required');      return; }
 
-    fetch('/api/manual', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        url:            val('m-url'),
-        transcript:     document.getElementById('m-transcript').value,
-        description:    document.getElementById('m-description').value,
-        title:          val('m-title'),
-        channel:        val('m-channel'),
-        fetch_metadata: document.getElementById('m-fetch-meta').checked,
-      }),
-    })
-    .then(r => r.json())
-    .then(d => {
-      if (d.error) { showError(d.error); return; }
-      streamJob(d.job_id, 'adding transcript', clearManual);
-    })
-    .catch(e => showError(String(e)));
-  }
-
-  const STAGE_LABEL = {clean: 'cleaning', enrich: 'enriching', ingest: 'ingesting'};
-
-  function runStage(stage) {
-    if (_running) return;
-    fetch(`/api/${stage}`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({}),
-    })
-      .then(r => r.json())
-      .then(d => {
-        if (d.error) { showError(d.error); return; }
-        streamJob(d.job_id, STAGE_LABEL[stage] || stage);
-      })
-      .catch(e => showError(String(e)));
-  }
-
-  function runAll() {
-    if (_running) return;
-    const url = document.getElementById('url-input').value.trim();
-    fetch('/api/run-all', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url: url}),
-    })
-      .then(r => r.json())
-      .then(d => {
-        if (d.error) { showError(d.error); return; }
-        streamJob(d.job_id, url ? 'scrape → clean → enrich → ingest' : 'clean → enrich → ingest');
-      })
-      .catch(e => showError(String(e)));
+    start('/api/manual', {
+      url:            val('m-url'),
+      transcript:     document.getElementById('m-transcript').value,
+      description:    document.getElementById('m-description').value,
+      title:          val('m-title'),
+      channel:        val('m-channel'),
+      fetch_metadata: document.getElementById('m-fetch-meta').checked,
+    }, 'light', clearManual);
   }
 
   // ── Videos table ─────────────────────────────────────────────────
@@ -650,19 +682,22 @@
             <td class="dim">${v.word_count ? v.word_count.toLocaleString() : '—'}</td>
             <td><a href="${esc(v.url)}" target="_blank" rel="noopener" title="Open on YouTube">↗</a></td>
           </tr>`).join('');
-      });
+      })
+      .catch(() => {});
   }
 
   // ── Status bar ───────────────────────────────────────────────────
 
   function loadStatus() {
-    fetch('/api/status')
+    return fetch('/api/status')
       .then(r => r.json())
       .then(s => {
         setDot('db',    s.database     === 'configured', s.database);
         setDot('blob',  s.blob_storage === 'mounted',    s.blob_storage);
         setDot('clean', s.clean_storage === 'available', s.clean_storage);
-      });
+        syncJobs(s.jobs || []);
+      })
+      .catch(() => {});   // a dropped poll is not something to shout about
   }
 
   function setDot(name, ok, label) {
@@ -674,6 +709,7 @@
   // ── Init ─────────────────────────────────────────────────────────
   loadStatus();
   loadVideos();
+  setInterval(loadStatus, POLL_MS);
 </script>
 </body>
 </html>
