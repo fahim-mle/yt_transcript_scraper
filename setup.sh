@@ -26,7 +26,9 @@ SERVE=1
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV=".venv"
 PORT="${PORT:-8000}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3:4b}"
+# Kept in step with config.py's default. Setup only checks/pulls the enrichment
+# model; the rewrite model (REWRITE_MODEL) is pulled on demand by that stage.
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.5:9b}"
 
 printf "\n%sYouTube Transcript Scraper — setup%s\n\n" "$c_bold" "$c_reset"
 
@@ -78,10 +80,12 @@ fi
 say "LLM enrichment (Ollama)"
 if command -v ollama >/dev/null; then
     if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
-        if ollama list 2>/dev/null | grep -q "${OLLAMA_MODEL%%:*}"; then
+        # Match the full tag, not the family prefix: "qwen3" alone also matches
+        # "qwen3.5:9b", which reports a model as present when it is not.
+        if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$OLLAMA_MODEL"; then
             ok "model '$OLLAMA_MODEL' available"
         else
-            warn "pulling '$OLLAMA_MODEL' (~2.5 GB, one time)…"
+            warn "pulling '$OLLAMA_MODEL' (several GB, one time)…"
             ollama pull "$OLLAMA_MODEL" && ok "model pulled" \
                 || warn "pull failed — clean will still run, without enrichment."
         fi
