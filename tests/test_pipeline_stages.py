@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -405,7 +406,7 @@ class EnrichStageOutcomeTests(unittest.TestCase):
         self.assertIn("A concise overview of the test video.", document)
         self.assertEqual(fake_db.enrichment_status, [(VIDEO_ID, "done")])
 
-    def test_persistence_failures_keep_the_video_queued_and_fail_the_stage(self):
+    def test_persistence_failures_keep_the_video_queued_without_failing_the_run(self):
         for name in ["database write fails", "knowledge document write fails"]:
             with self.subTest(name=name):
                 database_fails = name.startswith("database")
@@ -432,9 +433,92 @@ class EnrichStageOutcomeTests(unittest.TestCase):
 
                     result = pipeline.cmd_enrich(self._args(raw_dir, blob_dir))
 
-                self.assertIs(result, False)
+                # The run completed; the video is queue state, not a stage verdict.
+                # Reporting False here aborted every downstream run-all stage.
+                self.assertIs(result, True)
                 # Left in the retry queue rather than reported as enriched.
                 self.assertEqual(fake_db.enrichment_status, [(VIDEO_ID, "failed")])
+
+    def test_a_worker_that_cannot_start_reports_failure(self):
+        cases = [
+            ("no database", False, True, True),
+            ("llm disabled", True, False, True),
+            ("ollama unreachable", True, True, False),
+        ]
+        for name, db_available, llm_enabled, ollama_up in cases:
+            with self.subTest(name=name):
+                with (
+                    tempfile.TemporaryDirectory() as raw_dir,
+                    tempfile.TemporaryDirectory() as blob_dir,
+                    patch.object(pipeline, "_db_available", return_value=db_available),
+                    patch.object(pipeline, "db", _FakeDb()),
+                    patch.object(pipeline.config, "LLM_ENABLED", llm_enabled),
+                    patch.object(pipeline.llm_processor, "is_available", return_value=ollama_up),
+                ):
+                    result = pipeline.cmd_enrich(self._args(raw_dir, blob_dir))
+
+                self.assertIs(result, False)
+
+
+class AggregateLockTests(unittest.TestCase):
+    """
+    dataset.jsonl records run to hundreds of KB, far past PIPE_BUF, so an
+    append is not atomic against a reader. The manual add (writer) now runs
+    concurrently with enrich (reader), so the lock has to actually exclude.
+    """
+
+    def test_an_exclusive_holder_blocks_a_reader_until_it_releases(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            holding = threading.Event()
+            release = threading.Event()
+            acquired = threading.Event()
+
+            def writer():
+                with pipeline.aggregate_lock(output_dir, exclusive=True):
+                    holding.set()
+                    release.wait(5)
+
+            def reader():
+                with pipeline.aggregate_lock(output_dir, exclusive=False):
+                    acquired.set()
+
+            writer_thread = threading.Thread(target=writer)
+            writer_thread.start()
+            self.assertTrue(holding.wait(2))
+
+            reader_thread = threading.Thread(target=reader)
+            reader_thread.start()
+            try:
+                self.assertFalse(
+                    acquired.wait(0.3),
+                    "reader acquired the lock while a writer held it",
+                )
+            finally:
+                release.set()
+                writer_thread.join(5)
+                reader_thread.join(5)
+
+            self.assertTrue(acquired.is_set(), "reader never acquired the released lock")
+
+    def test_readers_do_not_exclude_each_other(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            inside = threading.Event()
+            release = threading.Event()
+
+            def reader():
+                with pipeline.aggregate_lock(output_dir, exclusive=False):
+                    inside.set()
+                    release.wait(5)
+
+            first = threading.Thread(target=reader)
+            first.start()
+            self.assertTrue(inside.wait(2))
+            try:
+                with pipeline.aggregate_lock(output_dir, exclusive=False):
+                    pass  # a second shared holder must not block
+            finally:
+                release.set()
+                first.join(5)
 
 
 class CliExitCodeTests(unittest.TestCase):
