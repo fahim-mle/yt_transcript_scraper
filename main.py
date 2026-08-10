@@ -34,10 +34,7 @@ import time
 from contextlib import contextmanager
 from urllib.parse import parse_qs, urlparse
 
-from dotenv import load_dotenv
-load_dotenv()
-
-import config
+import config  # loads .env on import
 from database import db
 from scraper import cleaner, formatter, llm_processor, manual, resolver, rewriter, transcript
 

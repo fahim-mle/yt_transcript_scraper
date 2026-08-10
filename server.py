@@ -21,9 +21,6 @@ import uuid
 from collections import deque
 from typing import Callable, Generator
 
-from dotenv import load_dotenv
-load_dotenv()
-
 # ── Logging setup ─────────────────────────────────────────────────────────────
 # Configure root logger before importing pipeline modules so that
 # logging.basicConfig() calls in main.py become no-ops (already have handlers).
@@ -59,7 +56,7 @@ _job_handler.setFormatter(_fmt)
 _root.addHandler(_job_handler)
 
 # Pipeline imports (safe now that logging is configured)
-import config
+import config  # loads .env on import
 import main as pipeline
 
 from fastapi import FastAPI, Header

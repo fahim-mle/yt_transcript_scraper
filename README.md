@@ -347,6 +347,19 @@ model spills to CPU and is much slower. Benchmark before committing.
 The storage defaults match the original author's machine — override
 `BLOB_OUTPUT_DIR` and `CLEAN_OUTPUT_DIR` for your own layout.
 
+**`config.py` is the single source of truth.** Every setting is
+`os.getenv(NAME, default)`, and `config.py` loads `.env` itself, so importing it
+is enough to get the effective value from anywhere — a stage, a script, a
+one-off `python -c`. Change a model in one place:
+
+```bash
+# .env — overrides the config.py default
+REWRITE_MODEL=gemma3:4b
+```
+
+Nothing else needs editing. `setup.sh` asks `config.py` which models to check
+and pull rather than keeping its own copy, so it follows `.env` automatically.
+
 ---
 
 ## Output structure

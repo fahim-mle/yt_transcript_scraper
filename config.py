@@ -1,4 +1,24 @@
+"""
+Single source of truth for configuration.
+
+Every value is `os.getenv(NAME, default)`, so `.env` overrides the default and
+nothing else needs to know a default exists. Reading a setting anywhere — a
+stage, a shell script, a one-off — means importing this module, never
+re-declaring the value.
+
+`.env` is loaded here rather than by each entry point. It used to be loaded in
+main.py and server.py just before importing this module, which worked for those
+two and silently failed everywhere else: any other caller got the hardcoded
+defaults while believing it had read the user's config.
+"""
+
 import os
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # pre-`pip install`, e.g. setup.sh probing defaults
+    pass
 
 # ── Directories ────────────────────────────────────────────────────────────
 # Stage 1 output — raw scraped files land here before cleaning.

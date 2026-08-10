@@ -109,4 +109,9 @@ Model choice is VRAM-bound — the target machine has 4 GB. Use `./benchmark.sh`
 
 ## Configuration
 
-Everything is env-driven through `config.py` (loaded from `.env` via `python-dotenv` at the top of `main.py`). Add new knobs there with an `os.getenv` default rather than reading the environment at the point of use, and mirror them in `.env.example`.
+`config.py` is the single source of truth and **loads `.env` itself on import**. Add new knobs there as `os.getenv(NAME, default)` rather than reading the environment at the point of use, and mirror them commented-out in `.env.example`.
+
+Two rules keep it that way, both covered by `tests/test_config.py`:
+
+- **Never re-declare a default outside `config.py`.** A model name (or any setting) written down in a shell script is a second source of truth and it drifts — `setup.sh` had `qwen3:4b` long after the project moved on. Shell scripts read values via `ask_config`, which shells out to `python -c "import config; print(...)"`. If you rename a config attribute, `setup.sh` probes it by name, so grep for `ask_config`.
+- **Never re-add `load_dotenv()` to an entry point.** It used to live in `main.py` and `server.py` just before importing config, which worked for those two and silently failed everywhere else: any other caller got the hardcoded defaults while believing it had read the user's `.env`.

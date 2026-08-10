@@ -26,9 +26,8 @@ SERVE=1
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV=".venv"
 PORT="${PORT:-8000}"
-# Kept in step with config.py's default. Setup only checks/pulls the enrichment
-# model; the rewrite model (REWRITE_MODEL) is pulled on demand by that stage.
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.5:9b}"
+# Model names are NOT set here. They come from config.py (which reads .env), so
+# there is exactly one place to change one. See ask_config() below.
 
 printf "\n%sYouTube Transcript Scraper — setup%s\n\n" "$c_bold" "$c_reset"
 
@@ -76,19 +75,32 @@ else
     fi
 fi
 
-# ── 5. Ollama enrichment model ─────────────────────────────────────────────
-say "LLM enrichment (Ollama)"
+# ── 5. Ollama models ───────────────────────────────────────────────────────
+# Read the effective settings from config.py, which applies .env on top of its
+# own defaults. Nothing about a model is duplicated in this script.
+ask_config() { "$VPY" -c "import config; print(getattr(config, '$1'))" 2>/dev/null; }
+
+ensure_model() {  # ensure_model <tag> <purpose>
+    local tag="$1" purpose="$2"
+    [[ -n "$tag" ]] || { warn "no model configured for $purpose — skipping"; return; }
+    # Match the full tag, not the family prefix: "qwen3" alone also matches
+    # "qwen3.5:9b", which reports a model as present when it is not.
+    if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$tag"; then
+        ok "$purpose model '$tag' available"
+    else
+        warn "pulling '$tag' for $purpose (several GB, one time)…"
+        ollama pull "$tag" && ok "model pulled" \
+            || warn "pull failed — the $purpose stage will be skipped until it is."
+    fi
+}
+
+say "LLM models (Ollama)"
 if command -v ollama >/dev/null; then
-    if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
-        # Match the full tag, not the family prefix: "qwen3" alone also matches
-        # "qwen3.5:9b", which reports a model as present when it is not.
-        if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$OLLAMA_MODEL"; then
-            ok "model '$OLLAMA_MODEL' available"
-        else
-            warn "pulling '$OLLAMA_MODEL' (several GB, one time)…"
-            ollama pull "$OLLAMA_MODEL" && ok "model pulled" \
-                || warn "pull failed — clean will still run, without enrichment."
-        fi
+    OLLAMA_HOST_URL="$(ask_config OLLAMA_HOST)"
+    if curl -sf "${OLLAMA_HOST_URL:-http://localhost:11434}/api/tags" >/dev/null 2>&1; then
+        ensure_model "$(ask_config OLLAMA_MODEL)"  "enrichment"
+        [[ "$(ask_config REWRITE_ENABLED)" == "True" ]] \
+            && ensure_model "$(ask_config REWRITE_MODEL)" "rewrite"
     else
         warn "Ollama installed but server not responding — start it with:  ollama serve"
         warn "  (clean still works without it; it just skips enrichment.)"
