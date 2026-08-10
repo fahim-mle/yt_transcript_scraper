@@ -1,6 +1,6 @@
 # yt_transcript_scraper
 
-A four-stage pipeline that turns YouTube transcripts into a structured personal
+A five-stage pipeline that turns YouTube transcripts into a structured personal
 knowledge base — designed for ML pipelines, semantic search, and long-term
 learning. Driven from a CLI or a local web UI.
 

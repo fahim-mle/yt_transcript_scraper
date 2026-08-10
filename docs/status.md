@@ -1,6 +1,6 @@
 # Project Status & Operations
 
-_Last updated: 2026-07-26_
+_Last updated: 2026-08-10_
 
 A living snapshot of where `yt_transcript_scraper` stands: what works, what
 needs improvement, how to deal with YouTube blocking, and where it's headed.
@@ -10,24 +10,32 @@ Read this first when returning to the project after a break.
 
 ## Where we are
 
-The pipeline is four stages, end to end:
+The pipeline is five stages, end to end:
 
 ```
-scrape  →  clean  →  enrich  →  ingest
+scrape  →  clean  →  rewrite  →  enrich  →  ingest
 ```
 
 - **scrape** — `yt-dlp` (metadata + playlist/channel discovery) + `youtube-transcript-api` (transcript text). Writes per-video `.md` + `.json` to `./output`, appends to `dataset.jsonl` and `index.csv`, records `status=raw` in PostgreSQL.
-- **clean** — fast, deterministic, **no LLM**. Produces reviewable `.md` in blob storage, sets `status=cleaned`, and queues the video for enrichment (`enrichment_status=pending`).
-- **enrich** — background, resumable, low-priority (`nice -n 19 ionice -c3`). A local Ollama model derives summary, key concepts, domains, difficulty, content kind, and sections; writes them to PostgreSQL + rewrites the blob `.md` as a knowledge doc. FIFO queue, marks each video `done` so it never reprocesses.
+- **clean** — fast, deterministic, **no LLM**. Produces reviewable `.md` in blob storage plus a verbatim `.transcript.md` companion, sets `status=cleaned`, and queues the video for rewrite and enrichment.
+- **rewrite** — background, resumable, low-priority. A local Ollama model turns caption prose into a readable article: chunked on paragraph boundaries, coverage-guarded, never summarising. Replaces the blob `.md`; the verbatim companion stays put.
+- **enrich** — background, resumable, low-priority (`nice -n 19 ionice -c3`). A local Ollama model derives summary, key concepts, domains, difficulty, content kind, and sections; writes them to PostgreSQL and layers them on top of the article. FIFO queue, marks each video `done` so it never reprocesses.
 - **ingest** — copies approved `.md` from blob storage to `/srv/dbdata`, sets `status=ingested`.
 
-A **FastAPI web UI** (`server.py`, port 8000) drives scrape/clean/ingest with live SSE logs. A **benchmark** command compares models on one transcript.
+Each video ends as **two files**: the article (`<Title>.md`) and the verbatim
+transcript (`<Title>.transcript.md`). The article is generated prose, so the
+transcript remains the citation and embedding anchor.
+
+A **FastAPI web UI** (`server.py`, port 8000) drives every stage with live SSE
+logs. A **benchmark** command compares models on one transcript.
 
 ---
 
 ## What's working
 
-- ✅ Scrape → clean → enrich → ingest pipeline, all four stages.
+- ✅ Scrape → clean → rewrite → enrich → ingest pipeline, all five stages.
+- ✅ **Article rewrite, validated on real output** (2026-08-09/10). 19 videos
+  rewritten with `gemma4:e4b`, **0 failures**. See "Rewrite results" below.
 - ✅ PostgreSQL schema (videos, sections, processing_runs, audit log) via `python main.py setup-db`; Unix-socket peer auth (`postgresql:///yt_transcripts`).
 - ✅ Aggregate outputs `dataset.jsonl` (one record/line, embed-ready) + `index.csv`.
 - ✅ Web UI: paste a video/playlist URL, watch live logs, see the video table + status dots.
@@ -44,7 +52,9 @@ A **FastAPI web UI** (`server.py`, port 8000) drives scrape/clean/ingest with li
 |---|---|---|
 | **IP currently blocked** | As of 2026-07-26 the home IP gets `IpBlocked` on the transcript **fetch** endpoint (`list()` still succeeds). Transient, but scraping is dead until it clears. Wait it out — hours, not minutes. | High |
 | **Ollama systemd service** | The unit is misconfigured and **stopped**; Ollama only runs if you start `ollama serve` manually. See "Ollama service" below. Won't survive a reboot. | High |
-| **Long transcripts** | Input is capped at `LLM_MAX_INPUT_WORDS` (5000); longer videos are truncated. A map-reduce pass over chunks is the real fix. | Medium |
+| **Rewrite throughput** | ~61 min/video average with `gemma4:e4b`. 40 videos still pending ≈ **40 hours**. Throughput is RAM-bound, not model-bound: the same model measured ~6 tok/s with memory free and ~1.5 tok/s while swapping. Check free RAM before a long run — it is worth roughly 4x. | High |
+| **`created_at` backfill** | The field ships, but the 56 videos staged before it existed have no stamp, so the 19 finished articles lack it. Values are omitted rather than invented; the real scrape times are in `videos.created_at` if a backfill is wanted. | Medium |
+| **Long transcripts (enrichment)** | Enrichment input is capped at `LLM_MAX_INPUT_WORDS` (now 25000); the 63k-word video still gets metadata from part of its text. Deriving enrichment from the rewritten chunks would remove the cap. `rewrite` itself has no cap. | Medium |
 | **Storage split** | 18 GB of models in `/home` (78% full) while the 373 GB partition holds an older 8.3 GB store. Consolidate. | Low |
 | **key_concepts** | Ollama's grammar can't enforce a non-empty array, so a fallback second call recovers concepts when the model returns `[]`. Works, but adds a call. Both small models hit it in the benchmark. | Low |
 
@@ -160,11 +170,63 @@ Each carries a stable `reason` slug and a `transient` flag:
 
 - [x] Harden transcript fetch (typed errors, backoff, optional proxy/cookies).
 - [x] Pick the production enrichment model after the post-reboot benchmark.
+- [x] Lossless article rewrite stage, CLI + web UI + Run All.
+- [ ] Drain the remaining 40 rewrites (~40 h; free RAM first).
+- [ ] Backfill `created_at` for the 56 pre-existing videos from `videos.created_at`.
 - [ ] Fix the Ollama systemd unit so it survives a reboot.
-- [ ] Map-reduce enrichment over chunks for long transcripts (removes the 5000-word cap).
+- [ ] Map-reduce enrichment over chunks for long transcripts (removes the input cap).
 - [ ] `embed` command — chunk clean transcripts → Qdrant/Chroma.
 - [ ] Semantic search CLI over the knowledge base.
 - [ ] Graph view of related content.
+
+---
+
+## Rewrite results (2026-08-10)
+
+First real run of the `rewrite` stage — `gemma4:e4b`, overnight, unattended.
+
+| | |
+|---|---|
+| Videos rewritten | **19** (`rewrite_status=done`) |
+| Failures | **0** |
+| Still queued | 40 |
+| Transcript words in | 129,155 |
+| Article words out | 122,605 |
+| **Overall coverage ratio** | **0.95** |
+| **Headings** | **92 → 318** |
+| Average time per video | ~61 min |
+
+**The coverage guard held.** A 0.95 overall ratio is what a faithful rewrite
+looks like: disfluencies and false starts removed, nothing else. No video
+tripped the guard's floor, and no chunk had to fall back to verbatim text.
+
+**Structure is the biggest visible win.** The Great Books series had **zero**
+headings before — those videos have no YouTube chapters, so the heuristic
+detector never fired and they were hundreds of undifferentiated paragraphs.
+They now carry 6–17 headings each. That was the worst case in the corpus and
+it is the one that improved most.
+
+Per-video ratios ran 0.83–1.02. The low end is the Ray Dalio interview at 0.83
+— plausible for a conversational format heavy with crosstalk and filler, but it
+is the one output worth spot-checking by hand before trusting the pattern.
+
+### Model comparison for rewriting (2026-08-09)
+
+One 490-word chunk of a Stanford lecture through the real rewrite path:
+
+| model | gen tok/s | ratio | retention | verdict |
+|---|---|---|---|---|
+| **gemma4:e4b** | **1.57** | **0.98** | **0.99** | **PASS** |
+| qwen3.5:9b | 1.42 | 1.03 | 0.96 | PASS |
+| qwen3:4b | — | — | — | timed out at 900 s |
+
+`gemma4:e4b` wins on both speed and fidelity. Note these rates were measured
+while the machine was memory-starved; with RAM free the same model reached
+~6 tok/s.
+
+`qwen3:4b` did not fail on quality — it never returned. Unconstrained
+generation lets a thinking model ramble indefinitely, which is why the rewriter
+applies the `/no_think` switch by model family and caps `num_predict` per chunk.
 
 ---
 
@@ -212,7 +274,13 @@ at the home store and grant the `ollama` user read access.
 
 ## Immediate next actions
 
-1. **Wait out the IP block**, then re-run the scrape — it resumes automatically.
-2. Fix the Ollama systemd unit (above) so enrichment survives a reboot.
-3. Drain the 13 pending enrichments (~45 min at ~200 s/video) and investigate
-   the 1 `failed` row.
+1. **Spot-check the Ray Dalio article** (ratio 0.83, the most compressed output)
+   against its `.transcript.md` companion. If it reads complete, the guard band
+   is calibrated correctly and the remaining 40 can run unattended.
+2. **Free RAM, then drain the 40 pending rewrites.** ~40 h at current rates, and
+   roughly 4x faster if the model is not competing for memory. Do not run
+   `rewrite` and `enrich` concurrently — that is what tips this box into swap.
+3. Re-run `enrich` afterwards. Rewriting sets `enrichment_status=pending` again
+   on purpose, because new prose invalidates metadata derived from the old text.
+4. Fix the Ollama systemd unit (above) so the workers survive a reboot.
+5. Decide on the `created_at` backfill for the 56 pre-existing videos.
