@@ -59,6 +59,16 @@ ALTER TABLE videos ADD COLUMN IF NOT EXISTS enrichment_status TEXT NOT NULL DEFA
 
 CREATE INDEX IF NOT EXISTS idx_videos_enrichment ON videos(enrichment_status);
 
+-- Article rewrite queue state — drives the background `rewrite` worker (FIFO).
+-- Independent of enrichment: rewriting is the slow LLM pass over the whole
+-- transcript, enrichment is a cheap metadata pass over the result.
+--   pending → cleaned, awaiting rewrite
+--   done    → article written, never reprocessed
+--   failed  → rewrite attempted and failed (eligible for retry)
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS rewrite_status TEXT NOT NULL DEFAULT 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_videos_rewrite ON videos(rewrite_status);
+
 -- ─────────────────────────────────────────────
 -- Audit log — append-only, no deletes
 -- Every change to an updatable field is recorded here.

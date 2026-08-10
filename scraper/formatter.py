@@ -2,6 +2,7 @@
 Converts video metadata + transcript segments into .md and .json output.
 """
 
+import datetime as dt
 import html
 import json
 import re
@@ -19,7 +20,8 @@ def format_timestamp(seconds: float) -> str:
 def sanitize_filename(name: str, max_len: int = 100) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
     name = re.sub(r"\s+", "_", name.strip())
-    return name[:max_len] or "untitled"
+    name = name[:max_len]
+    return "untitled" if name in {"", ".", ".."} else name
 
 
 def to_markdown(metadata: dict, segments: list[dict]) -> str:
@@ -56,28 +58,10 @@ def to_markdown(metadata: dict, segments: list[dict]) -> str:
 
 def to_clean_markdown(metadata: dict, cleaned_text: str) -> str:
     """Produces a clean .md with YAML frontmatter and paragraph-structured body."""
-    title = metadata.get("title", "")
-    channel = metadata.get("channel", "")
-    published = metadata.get("published", "")
-    url = metadata.get("url", "")
-    description = (metadata.get("description") or "").strip()
-    desc_yaml = _yaml_block_scalar(description) if description else '""'
-
-    lines = [
-        "---",
-        f'title: "{_escape_yaml(title)}"',
-        f'channel: "{_escape_yaml(channel)}"',
-        f'published: "{published}"',
-        f'url: "{url}"',
-        f"description: {desc_yaml}",
-        "---",
-        "",
-        "## Transcript",
-        "",
-        cleaned_text,
-        "",
-    ]
-    return "\n".join(lines)
+    return "\n".join(
+        ["---"] + _frontmatter_lines(metadata, None) + ["---", "", "## Transcript", "",
+                                                        cleaned_text, ""]
+    )
 
 
 def to_knowledge_doc(metadata: dict, cleaned_text: str, enrichment: dict | None) -> str:
@@ -90,36 +74,11 @@ def to_knowledge_doc(metadata: dict, cleaned_text: str, enrichment: dict | None)
     if enrichment is None:
         return to_clean_markdown(metadata, cleaned_text)
 
-    title = metadata.get("title", "")
-    channel = metadata.get("channel", "")
-    published = metadata.get("published", "")
-    url = metadata.get("url", "")
-    description = (metadata.get("description") or "").strip()
-    desc_yaml = _yaml_block_scalar(description) if description else '""'
-
     summary = (enrichment.get("summary") or "").strip()
     key_concepts = enrichment.get("key_concepts") or []
-    domains = enrichment.get("domains") or []
-    difficulty = enrichment.get("difficulty") or ""
-    content_kind = enrichment.get("content_kind") or ""
     sections = enrichment.get("sections") or []
-    summary_yaml = _yaml_block_scalar(summary) if summary else '""'
 
-    lines = [
-        "---",
-        f'title: "{_escape_yaml(title)}"',
-        f'channel: "{_escape_yaml(channel)}"',
-        f'published: "{published}"',
-        f'url: "{url}"',
-        f'difficulty: "{difficulty}"',
-        f'content_kind: "{content_kind}"',
-        f"domains: {_yaml_flow_list(domains)}",
-        f"key_concepts: {_yaml_flow_list(key_concepts)}",
-        f"summary: {summary_yaml}",
-        f"description: {desc_yaml}",
-        "---",
-        "",
-    ]
+    lines = ["---"] + _frontmatter_lines(metadata, enrichment) + ["---", ""]
 
     if summary:
         lines += ["## Summary", "", summary, ""]
@@ -145,6 +104,77 @@ def to_knowledge_doc(metadata: dict, cleaned_text: str, enrichment: dict | None)
     return "\n".join(lines)
 
 
+# Marks the start of rewritten prose. `enrich` reads the body back out from
+# here, so it can add metadata without paying for the rewrite a second time.
+ARTICLE_MARKER = "## Article"
+
+_ARTICLE_BODY_RE = re.compile(rf"^{re.escape(ARTICLE_MARKER)}\s*$", re.MULTILINE)
+
+
+def extract_article_body(md_content: str) -> str | None:
+    """Return the article prose from a rendered article doc, or None."""
+    m = _ARTICLE_BODY_RE.search(md_content)
+    if not m:
+        return None
+    body = md_content[m.end():].strip()
+    return body or None
+
+
+def to_article_doc(metadata: dict, article_body: str, enrichment: dict | None = None) -> str:
+    """
+    The primary artifact: enriched frontmatter, then the rewritten article.
+
+    The verbatim transcript is NOT included — it lives beside this file as
+    `<stem>.transcript.md` so the readable version stays readable and the
+    ground truth stays citable.
+    """
+    lines = ["---"] + _frontmatter_lines(metadata, enrichment) + ["---", ""]
+
+    if enrichment:
+        summary = (enrichment.get("summary") or "").strip()
+        key_concepts = enrichment.get("key_concepts") or []
+        if summary:
+            lines += ["## Summary", "", summary, ""]
+        if key_concepts:
+            lines += ["## Key Concepts", ""] + [f"- {c}" for c in key_concepts] + [""]
+
+    lines += [ARTICLE_MARKER, "", article_body, ""]
+    return "\n".join(lines)
+
+
+def to_transcript_doc(metadata: dict, cleaned_text: str) -> str:
+    """The verbatim companion — unmodified cleaned prose, for citation and embedding."""
+    return to_clean_markdown(metadata, cleaned_text)
+
+
+def _frontmatter_lines(metadata: dict, enrichment: dict | None) -> list[str]:
+    """Shared frontmatter body (no fences) for every document type."""
+    description = (metadata.get("description") or "").strip()
+    lines = [
+        f'title: "{_escape_yaml(metadata.get("title", ""))}"',
+        f'channel: "{_escape_yaml(metadata.get("channel", ""))}"',
+        f'published: "{metadata.get("published", "")}"',
+        f'url: "{metadata.get("url", "")}"',
+    ]
+    # When this entered the knowledge base, as opposed to when the video was
+    # published. Fast-moving subjects go stale on this clock, not that one, so
+    # it is what tells you a transcript is due for a re-scrape. Omitted rather
+    # than invented for records staged before the field existed.
+    if metadata.get("created_at"):
+        lines.append(f'created_at: "{metadata["created_at"]}"')
+    if enrichment:
+        summary = (enrichment.get("summary") or "").strip()
+        lines += [
+            f'difficulty: "{enrichment.get("difficulty") or ""}"',
+            f'content_kind: "{enrichment.get("content_kind") or ""}"',
+            f"domains: {_yaml_flow_list(enrichment.get('domains') or [])}",
+            f"key_concepts: {_yaml_flow_list(enrichment.get('key_concepts') or [])}",
+            f"summary: {_yaml_block_scalar(summary) if summary else '\"\"'}",
+        ]
+    lines.append(f"description: {_yaml_block_scalar(description) if description else '\"\"'}")
+    return lines
+
+
 def to_json(segments: list[dict]) -> str:
     return json.dumps(segments, ensure_ascii=False, indent=2)
 
@@ -155,10 +185,22 @@ def transcript_to_text(segments: list[dict]) -> str:
     return " ".join(p for p in parts if p)
 
 
+def now_stamp() -> str:
+    """
+    Local ISO 8601 timestamp with offset — the `date -Iseconds` shape.
+
+    Stamped once, when a video first enters dataset.jsonl. Every later stage
+    reads it back rather than re-stamping, so `clean`, `rewrite` and `enrich`
+    stay idempotent: regenerating a document must not change its frontmatter.
+    """
+    return dt.datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
 def to_jsonl_record(metadata: dict, segments: list[dict], md_path: str) -> dict:
     text = transcript_to_text(segments)
     return {
         "video_id":           metadata.get("video_id", ""),
+        "created_at":         metadata.get("created_at") or now_stamp(),
         "url":                metadata.get("url", ""),
         "title":              metadata.get("title", ""),
         "channel":            metadata.get("channel", ""),
