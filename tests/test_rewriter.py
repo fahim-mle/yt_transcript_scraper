@@ -1,10 +1,12 @@
 import json
+import os
+import tempfile
 import unittest
 import urllib.error
 from unittest.mock import patch
 
 import config
-from scraper import formatter, rewriter
+from scraper import formatter, llm_client, rewriter
 
 
 def _para(word: str, n: int) -> str:
@@ -155,7 +157,7 @@ class RewriteChunkTests(unittest.TestCase):
         temps = []
         chunk = self._chunk()
 
-        def record(prompt, temperature, source_words):
+        def record(prompt, temperature, source_words, usage=None):
             temps.append(temperature)
             return "short"
 
@@ -171,14 +173,16 @@ class RewriteChunkTests(unittest.TestCase):
         self.assertGreater(ceiling, legitimate)
         self.assertLess(ceiling, 900 * 4)
 
-    def test_ceiling_is_passed_to_ollama(self):
+    def test_ceiling_reaches_the_provider(self):
+        """The cap must survive the trip through the gateway, not just be computed."""
         captured = {}
 
         def fake_urlopen(req, timeout):
             captured.update(json.loads(req.data.decode()))
             raise urllib.error.URLError("stop here")
 
-        with patch.object(rewriter.urllib.request, "urlopen", fake_urlopen):
+        with patch.object(config, "LLM_PROVIDER", "ollama"), \
+                patch.object(llm_client.urllib.request, "urlopen", fake_urlopen):
             rewriter._call("p", 0.3, 900)
         self.assertEqual(captured["options"]["num_predict"], rewriter._output_ceiling(900))
 
@@ -216,7 +220,7 @@ class RewriteDocumentTests(unittest.TestCase):
         text = "\n\n".join(_para(f"seg{i}", 30) for i in range(3))
         seen = []
 
-        def record(prompt, temperature, source_words):
+        def record(prompt, temperature, source_words, usage=None):
             seen.append(prompt)
             return None
 
@@ -229,6 +233,127 @@ class RewriteDocumentTests(unittest.TestCase):
     def test_fence_wrapped_output_is_unwrapped(self):
         self.assertEqual(rewriter._strip_fences("```markdown\nhello\n```"), "hello")
         self.assertEqual(rewriter._strip_fences("plain"), "plain")
+
+
+class CheckpointTests(unittest.TestCase):
+    """
+    A long rewrite is hours of generation. Before checkpointing, an interrupted
+    run discarded all of it and the next run restarted the same video at chunk
+    1 — which is why a queue could never drain past its head.
+    """
+
+    def setUp(self):
+        for attr, value in (("REWRITE_CHUNK_WORDS", 50), ("REWRITE_CHECKPOINT", True)):
+            p = patch.object(config, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "progress", "vid.json")
+        # 8 paragraphs at 30 words against a 50-word target = 4 chunks, enough
+        # to interrupt partway and still have work left to resume.
+        self.text = "\n\n".join(_para(f"seg{i}", 30) for i in range(8))
+
+    @staticmethod
+    def _source_of(prompt: str) -> str:
+        """The chunk text _build_prompt embedded between the last <<< >>> pair."""
+        return prompt.rsplit("<<<", 1)[1].rsplit(">>>", 1)[0].strip()
+
+    def _interrupt_after(self, n_chunks):
+        """
+        A _call double that raises once it has answered `n_chunks` times.
+
+        It echoes the source with a marker prefix so the output passes the
+        coverage guard — a double that returns short text gets retried, which
+        would make "calls" and "chunks completed" two different numbers and the
+        test would be measuring the wrong thing.
+        """
+        calls = {"n": 0}
+
+        def call(prompt, temperature, source_words, usage=None):
+            if calls["n"] >= n_chunks:
+                raise KeyboardInterrupt("simulated interruption")
+            calls["n"] += 1
+            return f"MARK{calls['n']} {self._source_of(prompt)}"
+
+        return call, calls
+
+    def test_interrupted_run_resumes_instead_of_restarting(self):
+        call, _ = self._interrupt_after(2)
+        with patch.object(rewriter, "_call", side_effect=call):
+            with self.assertRaises(KeyboardInterrupt):
+                rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+
+        self.assertTrue(os.path.exists(self.path), "no checkpoint was written")
+
+        # Second run: the two finished chunks must not be regenerated.
+        second = []
+
+        def call2(prompt, temperature, source_words, usage=None):
+            second.append(prompt)
+            return f"LATER {self._source_of(prompt)}"
+
+        with patch.object(rewriter, "_call", side_effect=call2):
+            result = rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.resumed_from, 2)
+        self.assertEqual(len(second), result.chunks - 2,
+                         "resumed run regenerated chunks that were already done")
+        self.assertIn("MARK1", result.article)
+        self.assertIn("MARK2", result.article)
+
+    def test_checkpoint_is_cleared_by_the_caller_on_success(self):
+        with patch.object(rewriter, "_call", return_value="out"):
+            rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+        self.assertTrue(os.path.exists(self.path))
+        rewriter.clear_checkpoint(self.path)
+        self.assertFalse(os.path.exists(self.path))
+        rewriter.clear_checkpoint(self.path)  # idempotent — missing is success
+
+    def test_changed_source_invalidates_the_checkpoint(self):
+        """Resuming across an edited transcript would splice two documents."""
+        call, _ = self._interrupt_after(2)
+        with patch.object(rewriter, "_call", side_effect=call):
+            with self.assertRaises(KeyboardInterrupt):
+                rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+
+        different = "\n\n".join(_para(f"other{i}", 30) for i in range(8))
+        with patch.object(rewriter, "_call", return_value="fresh"):
+            result = rewriter.rewrite(different, "T", checkpoint_path=self.path)
+
+        self.assertEqual(result.resumed_from, 0, "stale checkpoint was reused")
+        self.assertNotIn("MARK1", result.article)
+
+    def test_changed_model_invalidates_the_checkpoint(self):
+        """Half an article from one model and half from another is not an article."""
+        call, _ = self._interrupt_after(2)
+        with patch.object(rewriter, "_call", side_effect=call):
+            with self.assertRaises(KeyboardInterrupt):
+                rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+
+        with patch.object(config, "REWRITE_MODEL", "a-different-model"), \
+                patch.object(rewriter, "_call", return_value="fresh"):
+            result = rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+
+        self.assertEqual(result.resumed_from, 0, "checkpoint survived a model change")
+
+    def test_corrupt_checkpoint_is_ignored_not_fatal(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{ truncated json")
+
+        with patch.object(rewriter, "_call", return_value="out"):
+            result = rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.resumed_from, 0)
+
+    def test_disabled_checkpointing_writes_nothing(self):
+        with patch.object(config, "REWRITE_CHECKPOINT", False), \
+                patch.object(rewriter, "_call", return_value="out"):
+            rewriter.rewrite(self.text, "T", checkpoint_path=self.path)
+        self.assertFalse(os.path.exists(self.path))
 
 
 class ArticleDocTests(unittest.TestCase):

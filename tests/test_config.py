@@ -1,14 +1,21 @@
 import importlib
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import config
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Model settings the developer's own .env may set. Stripped from the
+# environment of clean-dir subprocesses so those assert the code's fallbacks
+# rather than whichever provider this machine is pointed at today.
+_MODEL_VARS = frozenset({"ENRICH_MODEL", "OLLAMA_MODEL", "REWRITE_MODEL"})
 
 
 class EnvOverrideTests(unittest.TestCase):
@@ -18,22 +25,65 @@ class EnvOverrideTests(unittest.TestCase):
     """
 
     def _reload_with(self, **env):
+        """
+        Reload config with these variables set.
+
+        Only ever *sets* variables — never relies on unsetting one, because
+        config calls load_dotenv() on import and would immediately restore it
+        from the developer's real .env. Fallback behaviour is tested in
+        _config_in_clean_dir instead.
+        """
         with patch.dict(os.environ, env, clear=False):
             return importlib.reload(config)
+
+    def _config_in_clean_dir(self, expr: str, **env) -> str:
+        """
+        Evaluate `expr` against a config imported where no .env exists.
+
+        The developer's own .env legitimately sets ENRICH_MODEL and friends, and
+        a default/fallback test that reads it is testing the machine rather than
+        the code.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("config.py",):
+                shutil.copy(os.path.join(ROOT, name), tmp)
+            out = subprocess.run(
+                [sys.executable, "-c", f"import config; print({expr})"],
+                cwd=tmp, capture_output=True, text=True,
+                env={k: v for k, v in {**os.environ, **env}.items()
+                     if k not in _MODEL_VARS or k in env},
+            )
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return out.stdout.strip()
 
     def tearDown(self):
         importlib.reload(config)  # restore the real environment for other tests
 
     def test_environment_overrides_the_default(self):
-        reloaded = self._reload_with(OLLAMA_MODEL="probe:1b", REWRITE_MODEL="other:2b")
-        self.assertEqual(reloaded.OLLAMA_MODEL, "probe:1b")
+        reloaded = self._reload_with(ENRICH_MODEL="probe:1b", REWRITE_MODEL="other:2b")
+        self.assertEqual(reloaded.ENRICH_MODEL, "probe:1b")
         self.assertEqual(reloaded.REWRITE_MODEL, "other:2b")
+
+    def test_ollama_model_still_works_as_a_legacy_alias(self):
+        # OLLAMA_MODEL was the enrichment setting before the pipeline could
+        # target a non-Ollama provider. Existing .env files must keep working.
+        self.assertEqual(
+            self._config_in_clean_dir("config.ENRICH_MODEL", OLLAMA_MODEL="legacy:1b"),
+            "legacy:1b",
+        )
+
+    def test_explicit_enrich_model_wins_over_the_alias(self):
+        self.assertEqual(
+            self._config_in_clean_dir("config.ENRICH_MODEL",
+                                      ENRICH_MODEL="new:2b", OLLAMA_MODEL="legacy:1b"),
+            "new:2b",
+        )
 
     def test_the_two_model_settings_are_independent(self):
         # Rewriting rewards a strong writer; enrichment only fills in JSON.
         # Setting one must never silently move the other.
-        reloaded = self._reload_with(OLLAMA_MODEL="only-enrichment:1b")
-        self.assertEqual(reloaded.OLLAMA_MODEL, "only-enrichment:1b")
+        reloaded = self._reload_with(ENRICH_MODEL="only-enrichment:1b")
+        self.assertEqual(reloaded.ENRICH_MODEL, "only-enrichment:1b")
         self.assertNotEqual(reloaded.REWRITE_MODEL, "only-enrichment:1b")
 
     def test_numeric_and_boolean_settings_parse_from_strings(self):
@@ -52,9 +102,9 @@ class ImportContractTests(unittest.TestCase):
         any other caller silently got defaults while believing it had read .env.
         """
         out = subprocess.run(
-            [sys.executable, "-c", "import config; print(config.OLLAMA_MODEL)"],
+            [sys.executable, "-c", "import config; print(config.ENRICH_MODEL)"],
             cwd=ROOT, capture_output=True, text=True,
-            env={**os.environ, "OLLAMA_MODEL": "from-environment:9b"},
+            env={**os.environ, "ENRICH_MODEL": "from-environment:9b"},
         )
         self.assertEqual(out.stdout.strip(), "from-environment:9b", out.stderr)
 

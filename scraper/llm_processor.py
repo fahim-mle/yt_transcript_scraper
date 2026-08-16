@@ -11,15 +11,13 @@ Depends only on the stdlib for HTTP (urllib) plus Pydantic for validation —
 no extra Ollama client library required.
 """
 
-import json
 import logging
 import time
-import urllib.error
-import urllib.request
 
 from pydantic import BaseModel, Field, ValidationError
 
 import config
+from scraper import llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +55,28 @@ _CONTENT_KINDS = {"tutorial", "lecture", "talk", "interview", "explainer", "news
 
 # ── Prompt ─────────────────────────────────────────────────────────────────
 
-# The leading /no_think is qwen3's reliable soft-switch to skip chain-of-thought.
-# The `think: false` API flag isn't honored on all Ollama builds, and thinking
-# tokens make CPU inference impractically slow, so we disable it in the prompt too.
-_SYSTEM = (
-    "/no_think\n"
+_SYSTEM_BODY = (
     "You are a precise metadata extractor for a personal knowledge base built from "
     "YouTube transcripts. You read a cleaned transcript and produce structured metadata. "
     "Base everything strictly on the transcript content — do not invent facts. "
     "Respond with JSON only, matching the provided schema."
 )
+
+# The leading /no_think is qwen3's reliable soft-switch to skip chain-of-thought.
+# The `think: false` API flag isn't honored on all Ollama builds, and thinking
+# tokens make CPU inference impractically slow, so we disable it in the prompt
+# too. Applied by model family: on anything else it is a stray literal token in
+# the system prompt, which is exactly the sort of leak a shared gateway invites.
+_NO_THINK_PREFIXES = ("qwen",)
+
+
+def _system_prompt() -> str:
+    if config.ENRICH_MODEL.lower().startswith(_NO_THINK_PREFIXES):
+        return "/no_think\n" + _SYSTEM_BODY
+    return _SYSTEM_BODY
+
+
+_SYSTEM = _SYSTEM_BODY  # back-compat for tests that assert on the prompt text
 
 
 def _build_prompt(title: str, cleaned_text: str, chapter_titles: list[str]) -> str:
@@ -118,56 +128,33 @@ def get_call_stats() -> list[dict]:
     return list(_call_stats)
 
 
-def _call_ollama(prompt: str, schema: dict) -> dict | None:
-    """POST to Ollama /api/chat constrained to `schema`; returns parsed dict or None."""
-    payload = {
-        "model": config.OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "format": schema,
-        # This is structured extraction, not reasoning — disable qwen3's
-        # "thinking" mode so it emits the JSON directly instead of pages of
-        # chain-of-thought. Ignored by models that don't support it.
-        "think": False,
-        "options": {"temperature": 0.2, "num_ctx": config.OLLAMA_NUM_CTX},
-    }
-    req = urllib.request.Request(
-        f"{config.OLLAMA_HOST}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def _call_model(prompt: str, schema: dict,
+                usage: llm_client.Usage | None = None) -> dict | None:
+    """Ask the configured provider for JSON matching `schema`; parsed dict or None."""
+    result = llm_client.chat(
+        model=config.ENRICH_MODEL,
+        system=_system_prompt(),
+        user=prompt,
+        temperature=0.2,
+        schema=schema,
+        num_ctx=config.OLLAMA_NUM_CTX,
+        timeout=config.LLM_TIMEOUT_SECONDS,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=config.LLM_TIMEOUT_SECONDS) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        logger.warning("Ollama request failed (%s). Is the server running and the model pulled?", exc)
-        return None
-    except (TimeoutError, json.JSONDecodeError) as exc:
-        logger.warning("Ollama response problem: %s", exc)
-        return None
+    if usage is not None:
+        usage.add(result.usage)
 
-    # Capture Ollama's own timing counters (durations are nanoseconds).
+    # Throughput counters for `benchmark`. Ollama reports nanosecond durations
+    # per call; hosted providers report neither, so the benchmark's tok/s is
+    # only meaningful against a local model — which is what it is for.
     _call_stats.append({
-        "eval_count":           body.get("eval_count", 0),
-        "eval_duration":        body.get("eval_duration", 0),
-        "prompt_eval_count":    body.get("prompt_eval_count", 0),
-        "prompt_eval_duration": body.get("prompt_eval_duration", 0),
-        "load_duration":        body.get("load_duration", 0),
+        "eval_count":           result.usage.completion_tokens,
+        "eval_duration":        result.duration_ms * 1_000_000,
+        "prompt_eval_count":    result.usage.prompt_tokens,
+        "prompt_eval_duration": 0,
+        "load_duration":        0,
     })
 
-    content = (body.get("message") or {}).get("content", "")
-    if not content:
-        logger.warning("Ollama returned an empty message.")
-        return None
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        logger.warning("Model output was not valid JSON.")
-        return None
+    return result.data if result.ok else None
 
 
 def _normalise(e: Enrichment) -> Enrichment:
@@ -185,9 +172,10 @@ class _Concepts(BaseModel):
     concepts: list[str]
 
 
-def _extract_concepts(enrichment: Enrichment) -> list[str]:
+def _extract_concepts(enrichment: Enrichment,
+                      usage: llm_client.Usage | None = None) -> list[str]:
     """
-    Fallback for the empty-key_concepts case: Ollama's grammar doesn't enforce
+    Fallback for the empty-key_concepts case: a JSON grammar doesn't enforce
     array minItems, so the model sometimes returns []. Here we make one small,
     fast follow-up call over the already-generated summary + section notes to
     pull out concrete concepts. Cheap even on CPU (short input and output).
@@ -200,7 +188,7 @@ def _extract_concepts(enrichment: Enrichment) -> list[str]:
         "technical terms or named concepts (short noun phrases, e.g. "
         "'gradient descent'). Return them as the 'concepts' array.\n\n" + notes
     )
-    raw = _call_ollama(prompt, _Concepts.model_json_schema())
+    raw = _call_model(prompt, _Concepts.model_json_schema(), usage)
     if not raw:
         return []
     try:
@@ -214,12 +202,15 @@ def _extract_concepts(enrichment: Enrichment) -> list[str]:
 
 class Result:
     """Carries the enrichment plus timing/status for the processing_runs log."""
-    def __init__(self, enrichment: Enrichment | None, duration_ms: int, error: str | None):
+    def __init__(self, enrichment: Enrichment | None, duration_ms: int, error: str | None,
+                 usage: llm_client.Usage | None = None):
         self.enrichment = enrichment
         self.duration_ms = duration_ms
         self.error = error
         self.ok = enrichment is not None
-        self.model = config.OLLAMA_MODEL
+        self.model = config.ENRICH_MODEL
+        self.provider = config.LLM_PROVIDER
+        self.usage = usage or llm_client.Usage(calls=0)
 
 
 def enrich(title: str, cleaned_text: str, chapters: list[dict] | None = None) -> Result:
@@ -231,40 +222,36 @@ def enrich(title: str, cleaned_text: str, chapters: list[dict] | None = None) ->
     to writing a plain clean .md in that case.
     """
     started = time.monotonic()
+    usage = llm_client.Usage(calls=0)
     chapter_titles = [c["title"].strip() for c in (chapters or []) if c.get("title")]
     prompt = _build_prompt(title, _cap_words(cleaned_text, config.LLM_MAX_INPUT_WORDS), chapter_titles)
 
-    raw = _call_ollama(prompt, Enrichment.model_json_schema())
+    raw = _call_model(prompt, Enrichment.model_json_schema(), usage)
 
     if raw is None:
         elapsed = int((time.monotonic() - started) * 1000)
-        return Result(None, elapsed, "ollama_unavailable_or_invalid_json")
+        return Result(None, elapsed, "llm_unavailable_or_invalid_json", usage)
 
     try:
         enrichment = _normalise(Enrichment.model_validate(raw))
     except ValidationError as exc:
         elapsed = int((time.monotonic() - started) * 1000)
         logger.warning("Enrichment failed schema validation: %s", exc)
-        return Result(None, elapsed, f"validation_error: {exc.error_count()} issue(s)")
+        return Result(None, elapsed, f"validation_error: {exc.error_count()} issue(s)", usage)
 
     # The grammar can't enforce a non-empty key_concepts, so recover it here.
     if not enrichment.key_concepts:
         logger.info("key_concepts empty — running targeted concept extraction.")
-        enrichment.key_concepts = _extract_concepts(enrichment)
+        enrichment.key_concepts = _extract_concepts(enrichment, usage)
 
     elapsed = int((time.monotonic() - started) * 1000)
     logger.info(
         "Enriched in %d ms — %d concepts, %d sections.",
         elapsed, len(enrichment.key_concepts), len(enrichment.sections),
     )
-    return Result(enrichment, elapsed, None)
+    return Result(enrichment, elapsed, None, usage)
 
 
 def is_available() -> bool:
-    """Quick reachability check for the Ollama server."""
-    try:
-        req = urllib.request.Request(f"{config.OLLAMA_HOST}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=5):
-            return True
-    except Exception:
-        return False
+    """Quick reachability check for the configured LLM provider."""
+    return llm_client.is_available()

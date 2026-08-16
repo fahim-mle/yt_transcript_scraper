@@ -15,6 +15,8 @@ from contextlib import contextmanager
 import psycopg2
 import psycopg2.extras
 
+import config
+
 logger = logging.getLogger(__name__)
 
 # Fields that must never be changed after the initial insert.
@@ -30,6 +32,16 @@ UPDATABLE_FIELDS = frozenset({
     "topic", "tags", "notes",
     # Content metadata derived by LLM enrichment during `clean`
     "summary", "key_concepts", "domains", "difficulty", "content_kind",
+    # Generation provenance — which model produced the article/metadata
+    "article_model", "article_provider", "article_prompt_version",
+    "article_generated_at", "article_chunks", "article_fallback_chunks",
+    "enrichment_model", "enrichment_provider", "enriched_at",
+    # Source fidelity
+    "transcript_path", "article_word_count", "coverage_ratio", "captions_auto",
+    # Retrieval / embedding
+    "content_hash", "embedding_status", "embedded_at", "embedding_model",
+    # Learning workflow — owned by you, never written by the pipeline
+    "reviewed", "usefulness", "extracted_to", "open_questions",
 })
 
 
@@ -172,28 +184,54 @@ def record_processing_run(
     status: str,
     error: str | None = None,
     duration_ms: int | None = None,
+    *,
+    stage: str | None = None,
+    provider: str | None = None,
+    usage: dict | None = None,
 ) -> None:
-    """Append one enrichment attempt to processing_runs (audit / debugging)."""
+    """
+    Append one LLM attempt to processing_runs (audit / debugging / accounting).
+
+    Token counts are stored; cost is not. See the model_pricing note in
+    schema.sql — pricing is derived through the processing_run_costs view so
+    that subscription runs and metered runs stay honestly distinguishable.
+    """
+    usage = usage or {}
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO processing_runs (video_id, model, status, error, duration_ms)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (video_id, model, status, error, duration_ms))
+                INSERT INTO processing_runs (
+                    video_id, model, status, error, duration_ms,
+                    stage, provider, prompt_tokens, completion_tokens,
+                    cached_tokens, api_calls, billing_mode
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                video_id, model, status, error, duration_ms,
+                stage, provider,
+                usage.get("prompt_tokens"), usage.get("completion_tokens"),
+                usage.get("cached_tokens"), usage.get("calls"),
+                config.LLM_BILLING_MODE,
+            ))
 
 
 def list_pending_enrichment(limit: int | None = None) -> list[str]:
     """
     Return video_ids that are cleaned but not yet enriched, oldest first (FIFO).
-    'failed' rows are included so a later run can retry them.
+
+    'failed' rows are included so a later run retries them — but only while
+    they are under the attempt ceiling. Without that bound one video that fails
+    every time sits at the head of the queue forever and nothing behind it is
+    ever reached.
     """
     sql = (
         "SELECT video_id FROM videos "
         "WHERE status IN ('cleaned', 'ingested') "
         "AND enrichment_status IN ('pending', 'failed') "
+        "AND enrichment_attempts < %s "
         "ORDER BY created_at ASC"
     )
-    params: list = []
+    params: list = [config.QUEUE_MAX_ATTEMPTS]
     if limit is not None:
         sql += " LIMIT %s"
         params.append(limit)
@@ -203,31 +241,66 @@ def list_pending_enrichment(limit: int | None = None) -> list[str]:
             return [r[0] for r in cur.fetchall()]
 
 
-def set_enrichment_status(video_id: str, status: str) -> None:
+def _set_queue_status(video_id: str, status: str, status_col: str, attempts_col: str) -> None:
     """
-    Set the enrichment queue state (pending | done | failed). This is transient
-    operational state, so it's a plain UPDATE — not written to the audit log.
+    Move a video through a queue's state machine, maintaining its attempt count.
+
+    `failed` increments the counter and promotes to `blocked` once the ceiling
+    is reached, so a permanently broken video leaves the queue instead of
+    blocking it. `done` and `pending` both reset the counter — a success or an
+    explicit requeue means the next failure starts a fresh budget.
+
+    Transient operational state, so this is a plain UPDATE, not audit-logged.
     """
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE videos SET enrichment_status = %s WHERE video_id = %s",
-                (status, video_id),
-            )
+            if status == "failed":
+                cur.execute(
+                    f"UPDATE videos SET {attempts_col} = {attempts_col} + 1, "
+                    f"{status_col} = CASE WHEN {attempts_col} + 1 >= %s "
+                    f"THEN 'blocked' ELSE 'failed' END "
+                    f"WHERE video_id = %s RETURNING {status_col}, {attempts_col}",
+                    (config.QUEUE_MAX_ATTEMPTS, video_id),
+                )
+                row = cur.fetchone()
+                if row and row[0] == "blocked":
+                    logger.warning(
+                        "%s blocked after %d failed attempt(s) — it will be skipped "
+                        "until requeued.", video_id, row[1],
+                    )
+            elif status in {"done", "pending"}:
+                cur.execute(
+                    f"UPDATE videos SET {status_col} = %s, {attempts_col} = 0 "
+                    f"WHERE video_id = %s",
+                    (status, video_id),
+                )
+            else:
+                cur.execute(
+                    f"UPDATE videos SET {status_col} = %s WHERE video_id = %s",
+                    (status, video_id),
+                )
+
+
+def set_enrichment_status(video_id: str, status: str) -> None:
+    """Set the enrichment queue state (pending | done | failed | blocked)."""
+    _set_queue_status(video_id, status, "enrichment_status", "enrichment_attempts")
 
 
 def list_pending_rewrite(limit: int | None = None) -> list[str]:
     """
     Return video_ids that are cleaned but not yet rewritten, oldest first (FIFO).
-    'failed' rows are included so a later run can retry them.
+
+    'failed' rows are retried only while under the attempt ceiling — see
+    list_pending_enrichment for why the bound exists.
     """
     sql = (
         "SELECT video_id FROM videos "
         "WHERE status IN ('cleaned', 'ingested') "
         "AND rewrite_status IN ('pending', 'failed') "
+        "AND rewrite_attempts < %s "
         "ORDER BY created_at ASC"
     )
-    params: list = []
+    params: list = [config.QUEUE_MAX_ATTEMPTS]
     if limit is not None:
         sql += " LIMIT %s"
         params.append(limit)
@@ -238,13 +311,56 @@ def list_pending_rewrite(limit: int | None = None) -> list[str]:
 
 
 def set_rewrite_status(video_id: str, status: str) -> None:
-    """Set the rewrite queue state (pending | done | failed). Transient state."""
+    """Set the rewrite queue state (pending | done | failed | blocked)."""
+    _set_queue_status(video_id, status, "rewrite_status", "rewrite_attempts")
+
+
+def requeue(video_ids: list[str] | None = None, *, stage: str) -> int:
+    """
+    Return blocked/failed videos to 'pending' and clear their attempt budget.
+
+    The escape hatch for the attempt ceiling: once you have fixed whatever was
+    breaking (a model, a timeout, a bad key), this puts the casualties back in
+    line. With no ids, requeues every blocked video for that stage.
+    """
+    if stage not in {"rewrite", "enrichment"}:
+        raise ValueError(f"unknown stage {stage!r}")
+    status_col, attempts_col = f"{stage}_status", f"{stage}_attempts"
+
+    sql = (f"UPDATE videos SET {status_col} = 'pending', {attempts_col} = 0 "
+           f"WHERE {status_col} IN ('blocked', 'failed')")
+    params: list = []
+    if video_ids:
+        sql += " AND video_id = ANY(%s)"
+        params.append(list(video_ids))
+
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE videos SET rewrite_status = %s WHERE video_id = %s",
-                (status, video_id),
-            )
+            cur.execute(sql, params)
+            return cur.rowcount
+
+
+def usage_summary(days: int = 30) -> list[dict]:
+    """
+    Token totals and derived cost per (stage, provider, model, billing_mode).
+
+    Reads processing_run_costs rather than processing_runs so pricing stays a
+    view concern — nothing here knows what a token costs.
+    """
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT stage, provider, model, billing_mode,
+                       COUNT(*)                    AS runs,
+                       SUM(prompt_tokens)          AS prompt_tokens,
+                       SUM(completion_tokens)      AS completion_tokens,
+                       SUM(cost_usd)               AS cost_usd
+                FROM processing_run_costs
+                WHERE created_at >= NOW() - make_interval(days => %s)
+                GROUP BY stage, provider, model, billing_mode
+                ORDER BY SUM(completion_tokens) DESC NULLS LAST
+            """, (days,))
+            return [dict(r) for r in cur.fetchall()]
 
 
 def get_sections(video_id: str) -> list[dict]:

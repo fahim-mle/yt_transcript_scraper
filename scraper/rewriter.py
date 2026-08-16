@@ -23,14 +23,15 @@ Two design constraints drive everything here:
      chunk degrades to unpolished prose, never to missing prose.
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import time
-import urllib.error
-import urllib.request
 
 import config
+from scraper import llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,13 @@ _SYSTEM = (
     "Output only the rewritten markdown. No preamble, no explanation."
 )
 
+# Identity of the instructions that produced an article, recorded alongside it.
+# Derived from the prompt text rather than hand-maintained: a version number a
+# human has to remember to bump is a version number that silently goes stale,
+# and then provenance claims an article was produced by instructions it never
+# saw. Editing _SYSTEM changes this automatically.
+PROMPT_VERSION = "rewrite-" + hashlib.sha256(_SYSTEM.encode("utf-8")).hexdigest()[:8]
+
 # qwen's reliable soft-switch for skipping chain-of-thought. The `think: false`
 # API flag is not honoured on every Ollama build, and on a rewrite pass thinking
 # tokens are catastrophic: the model spends minutes reasoning about prose it
@@ -220,41 +228,23 @@ def _output_ceiling(source_words: int) -> int:
     return int(source_words * config.REWRITE_MAX_RATIO * 1.4) + 128
 
 
-def _call(prompt: str, temperature: float, source_words: int) -> str | None:
-    payload = {
-        "model": config.REWRITE_MODEL,
-        "messages": [
-            {"role": "system", "content": _system_prompt()},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        # Rewriting is a transform, not a reasoning task. Thinking tokens would
-        # double the cost of the slowest stage in the pipeline for no gain.
-        "think": False,
-        "options": {
-            "temperature": temperature,
-            "num_ctx": config.REWRITE_NUM_CTX,
-            "num_predict": _output_ceiling(source_words),
-        },
-    }
-    req = urllib.request.Request(
-        f"{config.OLLAMA_HOST}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def _call(prompt: str, temperature: float, source_words: int,
+          usage: llm_client.Usage | None = None) -> str | None:
+    """One rewrite request. Token usage is accumulated into `usage` if given."""
+    result = llm_client.chat(
+        model=config.REWRITE_MODEL,
+        system=_system_prompt(),
+        user=prompt,
+        temperature=temperature,
+        max_tokens=_output_ceiling(source_words),
+        num_ctx=config.REWRITE_NUM_CTX,
+        timeout=config.REWRITE_TIMEOUT_SECONDS,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=config.REWRITE_TIMEOUT_SECONDS) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        logger.warning("Rewrite request failed (%s). Is Ollama running with %s pulled?",
-                       exc, config.REWRITE_MODEL)
+    if usage is not None:
+        usage.add(result.usage)
+    if not result.ok:
         return None
-    except (TimeoutError, json.JSONDecodeError) as exc:
-        logger.warning("Rewrite response problem: %s", exc)
-        return None
-
-    return _strip_fences((body.get("message") or {}).get("content", "").strip())
+    return _strip_fences(result.text.strip())
 
 
 _FENCE_RE = re.compile(r"^```(?:markdown|md)?\s*\n(.*)\n```$", re.DOTALL)
@@ -272,7 +262,9 @@ class Result:
     """The rewritten article plus per-run stats for logging and the run log."""
 
     def __init__(self, article: str | None, *, chunks: int, fallbacks: int,
-                 duration_ms: int, error: str | None) -> None:
+                 duration_ms: int, error: str | None,
+                 usage: llm_client.Usage | None = None,
+                 resumed_from: int = 0) -> None:
         self.article = article
         self.chunks = chunks
         self.fallbacks = fallbacks
@@ -280,9 +272,15 @@ class Result:
         self.error = error
         self.ok = article is not None
         self.model = config.REWRITE_MODEL
+        self.provider = config.LLM_PROVIDER
+        self.usage = usage or llm_client.Usage(calls=0)
+        # How many chunks came from a checkpoint rather than this run. Non-zero
+        # means an earlier interrupted run's work was reused.
+        self.resumed_from = resumed_from
 
 
-def rewrite_chunk(chunk: Chunk, title: str, context_tail: str) -> tuple[str, bool]:
+def rewrite_chunk(chunk: Chunk, title: str, context_tail: str,
+                  usage: llm_client.Usage | None = None) -> tuple[str, bool]:
     """
     Rewrite one chunk. Returns (text, used_fallback).
 
@@ -295,7 +293,7 @@ def rewrite_chunk(chunk: Chunk, title: str, context_tail: str) -> tuple[str, boo
     for attempt in range(config.REWRITE_MAX_ATTEMPTS):
         # Cool down on retry: the usual failure is a chatty model padding or
         # summarising, and lower temperature makes it track the source harder.
-        output = _call(prompt, 0.3 if attempt == 0 else 0.15, chunk.words)
+        output = _call(prompt, 0.3 if attempt == 0 else 0.15, chunk.words, usage)
         if output is None:
             break
         failure = _coverage_failure(chunk.text, output)
@@ -309,13 +307,81 @@ def rewrite_chunk(chunk: Chunk, title: str, context_tail: str) -> tuple[str, boo
     return chunk.text, True
 
 
-def rewrite(cleaned_text: str, title: str) -> Result:
+def _fingerprint(cleaned_text: str) -> str:
+    """
+    Identity of a rewrite job. Any change to the source or to the settings that
+    shape the output invalidates a checkpoint, so resumed work is never a
+    mixture of two configurations.
+    """
+    material = "\x00".join([
+        cleaned_text,
+        config.REWRITE_MODEL,
+        config.LLM_PROVIDER,
+        str(config.REWRITE_CHUNK_WORDS),
+        str(config.REWRITE_CONTEXT_WORDS),
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _load_checkpoint(path: str | None, fingerprint: str) -> dict | None:
+    if not path or not config.REWRITE_CHECKPOINT or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Ignoring unreadable rewrite checkpoint %s: %s", path, exc)
+        return None
+    if state.get("fingerprint") != fingerprint:
+        logger.info("Rewrite checkpoint is stale (source or settings changed) — starting fresh.")
+        return None
+    return state
+
+
+def _save_checkpoint(path: str | None, state: dict) -> None:
+    """
+    Persist progress atomically. A torn checkpoint is worse than none: it would
+    fail the fingerprint check and silently discard good work, so the write goes
+    to a temp file and is renamed into place.
+    """
+    if not path or not config.REWRITE_CHECKPOINT:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("Could not write rewrite checkpoint %s: %s", path, exc)
+
+
+def clear_checkpoint(path: str | None) -> None:
+    """Drop a finished job's checkpoint. Missing file is success, not an error."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not remove rewrite checkpoint %s: %s", path, exc)
+
+
+def rewrite(cleaned_text: str, title: str, *, checkpoint_path: str | None = None,
+            label: str = "") -> Result:
     """
     Rewrite a whole cleaned transcript into article markdown.
 
     Always returns a Result. `ok` is False only when there was nothing to do;
     individual chunk failures degrade to verbatim text and are counted in
     `fallbacks` rather than failing the run.
+
+    With `checkpoint_path`, each finished chunk is persisted before the next is
+    started. A long rewrite is hours of generation, and an interrupted run used
+    to discard all of it — so the same video restarted from chunk 1 on every
+    run and a queue could never drain. Resuming picks up at the first chunk that
+    was never completed.
     """
     started = time.monotonic()
 
@@ -326,16 +392,33 @@ def rewrite(cleaned_text: str, title: str) -> Result:
                       error="no_prose_to_rewrite")
 
     total_words = sum(c.words for c in chunks)
-    logger.info("Rewriting %d words in %d chunk(s) with %s.",
-                total_words, len(chunks), config.REWRITE_MODEL)
+    fingerprint = _fingerprint(cleaned_text)
+    usage = llm_client.Usage(calls=0)
 
-    parts: list[str] = []
-    context_tail = ""
-    fallbacks = 0
-    last_heading: str | None = None
+    state = _load_checkpoint(checkpoint_path, fingerprint) or {}
+    parts: list[str] = list(state.get("parts", []))
+    context_tail: str = state.get("context_tail", "")
+    fallbacks: int = state.get("fallbacks", 0)
+    last_heading: str | None = state.get("last_heading")
+    done: int = state.get("done", 0)
+    resumed_from = done
+
+    # Videos are rewritten concurrently, so every progress line has to say which
+    # video it belongs to or the log is unreadable soup.
+    tag = f"[{label}] " if label else ""
+
+    if done:
+        logger.info("%sResuming rewrite of %s at chunk %d/%d — %d chunk(s) already done.",
+                    tag, title, done + 1, len(chunks), done)
+    else:
+        logger.info("%sRewriting %d words in %d chunk(s) with %s via %s.",
+                    tag, total_words, len(chunks), config.REWRITE_MODEL, llm_client.describe())
 
     for i, chunk in enumerate(chunks, 1):
-        text, used_fallback = rewrite_chunk(chunk, title, context_tail)
+        if i <= done:
+            continue
+
+        text, used_fallback = rewrite_chunk(chunk, title, context_tail, usage)
         fallbacks += used_fallback
 
         # A long section spans several chunks; emit its heading only once.
@@ -345,24 +428,30 @@ def rewrite(cleaned_text: str, title: str) -> Result:
         parts.append(text)
 
         context_tail = " ".join(text.split()[-config.REWRITE_CONTEXT_WORDS:])
-        logger.info("  chunk %d/%d — %d words in, %d out%s",
-                    i, len(chunks), chunk.words, len(text.split()),
+        logger.info("  %schunk %d/%d — %d words in, %d out%s",
+                    tag, i, len(chunks), chunk.words, len(text.split()),
                     " (verbatim fallback)" if used_fallback else "")
+
+        _save_checkpoint(checkpoint_path, {
+            "fingerprint": fingerprint,
+            "done": i,
+            "parts": parts,
+            "context_tail": context_tail,
+            "fallbacks": fallbacks,
+            "last_heading": last_heading,
+            "usage": usage.as_dict(),
+        })
 
     elapsed = int((time.monotonic() - started) * 1000)
     article = "\n\n".join(parts)
-    logger.info("Rewrote %s in %.1f min — %d chunk(s), %d fallback(s), %d → %d words.",
-                title, elapsed / 60000, len(chunks), fallbacks,
+    logger.info("%sRewrote %s in %.1f min — %d chunk(s), %d fallback(s), %d → %d words.",
+                tag, title, elapsed / 60000, len(chunks), fallbacks,
                 total_words, len(article.split()))
     return Result(article, chunks=len(chunks), fallbacks=fallbacks,
-                  duration_ms=elapsed, error=None)
+                  duration_ms=elapsed, error=None, usage=usage,
+                  resumed_from=resumed_from)
 
 
 def is_available() -> bool:
-    """Reachability check for the Ollama server (shared host with enrichment)."""
-    try:
-        req = urllib.request.Request(f"{config.OLLAMA_HOST}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=5):
-            return True
-    except Exception:
-        return False
+    """Reachability check for the configured LLM provider."""
+    return llm_client.is_available()

@@ -22,9 +22,12 @@ Examples:
 """
 
 import argparse
+import concurrent.futures
+import contextlib
 import csv
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -36,7 +39,9 @@ from urllib.parse import parse_qs, urlparse
 
 import config  # loads .env on import
 from database import db
-from scraper import cleaner, formatter, llm_processor, manual, resolver, rewriter, transcript
+from scraper import (
+    cleaner, formatter, llm_client, llm_processor, manual, resolver, rewriter, transcript,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -642,6 +647,7 @@ def _enrich_one(video_id: str, rec: dict, blob_dir: str) -> str:
             video_id, result.model,
             "success" if result.ok else "failed",
             result.error, result.duration_ms,
+            stage="enrich", provider=result.provider, usage=result.usage.as_dict(),
         )
     except Exception as exc:
         logger.warning("Run log failed for %s: %s", video_id, exc)
@@ -657,6 +663,10 @@ def _enrich_one(video_id: str, rec: dict, blob_dir: str) -> str:
         "domains":      enrichment.get("domains") or [],
         "difficulty":   enrichment.get("difficulty"),
         "content_kind": enrichment.get("content_kind"),
+        # Provenance: which model produced this metadata, and when.
+        "enrichment_model":    result.model,
+        "enrichment_provider": result.provider,
+        "enriched_at":         dt.datetime.now().astimezone(),
     })
     db.upsert_sections(
         video_id,
@@ -687,12 +697,108 @@ def _read_article_body(blob_path: str) -> str | None:
 
 # ── rewrite (background worker) ────────────────────────────────────────────
 
-def _rewrite_one(video_id: str, rec: dict, blob_dir: str) -> str:
+def _resolve_workers(args: argparse.Namespace) -> int:
+    """
+    How many videos to process concurrently.
+
+    Auto (0) means 1 for a local model and 4 for a hosted one: parallel calls to
+    Ollama contend for one GPU and gain nothing, while a hosted worker spends
+    almost all its time waiting on the network.
+    """
+    requested = getattr(args, "workers", None)
+    if requested is None:
+        requested = config.LLM_WORKERS
+    if requested and requested > 0:
+        return requested
+    return 1 if config.LLM_PROVIDER == "ollama" else 4
+
+
+# Set by server.py. Log records are routed to a job by thread id, so a worker
+# thread this module spawns is invisible to the UI until it adopts the job
+# binding of the thread that started it. Outside the web UI this stays None and
+# `_worker_context` is a no-op.
+worker_thread_hook = None
+
+
+def _worker_context():
+    """Context-manager factory each pool worker enters, so its logs reach the UI."""
+    if worker_thread_hook is None:
+        return contextlib.nullcontext
+    return worker_thread_hook()
+
+
+def _run_pool(video_ids: list[str], work, workers: int) -> list[tuple[str, str]]:
+    """
+    Run `work(video_id)` over the queue, returning (video_id, outcome) pairs.
+
+    Sequential when workers == 1 so the single-worker path keeps its exact
+    previous behaviour and stays trivially debuggable.
+    """
+    adopt = _worker_context()
+
+    def guarded(video_id: str) -> tuple[str, str]:
+        with adopt():
+            return video_id, work(video_id)
+
+    if workers <= 1:
+        return [guarded(vid) for vid in video_ids]
+
+    results: list[tuple[str, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="llm") as pool:
+        for future in concurrent.futures.as_completed(
+                [pool.submit(guarded, vid) for vid in video_ids]):
+            results.append(future.result())
+    return results
+
+
+def _checkpoint_path(raw_dir: str, video_id: str) -> str:
+    """Where a partially finished rewrite parks its progress."""
+    return os.path.join(raw_dir, ".rewrite_progress", f"{video_id}.json")
+
+
+def _record_article_provenance(video_id: str, result, source_text: str,
+                               transcript_path: str) -> None:
+    """
+    Record who generated this article and how faithful it is.
+
+    The article is generated prose, so "which model wrote this" is part of the
+    record, not an implementation detail — it is what lets you re-run only the
+    documents produced by a model you stopped trusting. `content_hash` covers
+    the article body alone, so it moves only when the prose actually changes and
+    can drive embedding staleness independently of any timestamp.
+    """
+    source_words = len(source_text.split())
+    article_words = len(result.article.split())
+    try:
+        db.update_video(video_id, {
+            "article_model":           result.model,
+            "article_provider":        result.provider,
+            "article_prompt_version":  rewriter.PROMPT_VERSION,
+            "article_generated_at":    dt.datetime.now().astimezone(),
+            "article_chunks":          result.chunks,
+            "article_fallback_chunks": result.fallbacks,
+            "article_word_count":      article_words,
+            "coverage_ratio":          (article_words / source_words) if source_words else None,
+            "transcript_path":         transcript_path,
+            "content_hash":            hashlib.sha256(
+                result.article.encode("utf-8")).hexdigest(),
+            # New prose invalidates any vector built from the old text.
+            "embedding_status":        "pending",
+        })
+    except Exception as exc:
+        logger.warning("Could not record article provenance for %s: %s", video_id, exc)
+
+
+def _rewrite_one(video_id: str, rec: dict, blob_dir: str, raw_dir: str) -> str:
     """
     Rewrite one video's transcript into an article and write it to blob storage.
 
     Writes the verbatim companion first, so the ground truth is on disk before
     any generated prose replaces the readable file. Returns an outcome string.
+
+    Chunk progress is checkpointed under `raw_dir`, so an interrupted rewrite
+    resumes where it stopped instead of regenerating hours of prose.
     """
     meta = _meta_from_record(rec)
     chapters = rec.get("chapters") or []
@@ -709,18 +815,23 @@ def _rewrite_one(video_id: str, rec: dict, blob_dir: str) -> str:
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write(formatter.to_transcript_doc(meta, cleaned_text))
 
-    result = rewriter.rewrite(cleaned_text, meta["title"])
+    result = rewriter.rewrite(cleaned_text, meta["title"],
+                              checkpoint_path=_checkpoint_path(raw_dir, video_id),
+                              label=video_id)
 
     try:
         db.record_processing_run(
             video_id, result.model,
             "success" if result.ok else "failed",
             result.error, result.duration_ms,
+            stage="rewrite", provider=result.provider, usage=result.usage.as_dict(),
         )
     except Exception as exc:
         logger.warning("Run log failed for %s: %s", video_id, exc)
 
     if not result.ok or result.article is None:
+        # The checkpoint is deliberately left in place: the next attempt should
+        # resume this video, not regenerate the chunks that already succeeded.
         db.set_rewrite_status(video_id, "failed")
         return "failed"
 
@@ -729,6 +840,9 @@ def _rewrite_one(video_id: str, rec: dict, blob_dir: str) -> str:
     with open(blob_path, "w", encoding="utf-8") as f:
         f.write(formatter.to_article_doc(meta, result.article))
 
+    _record_article_provenance(video_id, result, cleaned_text, transcript_path)
+
+    rewriter.clear_checkpoint(_checkpoint_path(raw_dir, video_id))
     db.set_rewrite_status(video_id, "done")
     # A new article invalidates metadata derived from the old text.
     db.set_enrichment_status(video_id, "pending")
@@ -750,12 +864,14 @@ def cmd_rewrite(args: argparse.Namespace) -> bool:
         logger.error("REWRITE_ENABLED=0 — nothing to do. Set it to 1 in .env to rewrite.")
         return False
     if not rewriter.is_available():
-        logger.error("Ollama is not reachable at %s — start it and retry.",
-                     config.OLLAMA_HOST)
+        logger.error("LLM provider is not reachable (%s) — check it and retry.",
+                     llm_client.describe())
         return False
 
-    logger.info("Rewrite worker — model: %s, ~%d words/chunk",
-                config.REWRITE_MODEL, config.REWRITE_CHUNK_WORDS)
+    workers = _resolve_workers(args)
+    logger.info("Rewrite worker — %s, model: %s, ~%d words/chunk, %d video(s) at a time",
+                llm_client.describe(), config.REWRITE_MODEL,
+                config.REWRITE_CHUNK_WORDS, workers)
 
     processed, failures = 0, 0
     while True:
@@ -769,20 +885,21 @@ def cmd_rewrite(args: argparse.Namespace) -> bool:
             continue
 
         logger.info("%d video(s) queued for rewrite.", len(pending))
-        for video_id in pending:
+
+        def rewrite_one(video_id: str) -> str:
             rec = records.get(video_id)
             if rec is None:
                 logger.warning("No staged record for %s — marking failed.", video_id)
                 db.set_rewrite_status(video_id, "failed")
-                failures += 1
-                continue
+                return "failed"
             try:
-                outcome = _rewrite_one(video_id, rec, args.blob_dir)
+                return _rewrite_one(video_id, rec, args.blob_dir, args.raw_dir)
             except Exception as exc:
                 logger.error("Rewrite failed for %s: %s", video_id, exc)
                 db.set_rewrite_status(video_id, "failed")
-                failures += 1
-                continue
+                return "failed"
+
+        for _, outcome in _run_pool(pending, rewrite_one, workers):
             processed += 1
             if outcome == "failed":
                 failures += 1
@@ -829,11 +946,13 @@ def cmd_enrich(args: argparse.Namespace) -> bool:
         logger.error("LLM_ENABLED=0 — nothing to do. Set it to 1 in .env to enrich.")
         return False
     if not llm_processor.is_available():
-        logger.error("Ollama unreachable at %s — start it (`ollama serve`) and retry.",
-                     config.OLLAMA_HOST)
+        logger.error("LLM provider unreachable (%s) — check it and retry.",
+                     llm_client.describe())
         return False
 
-    logger.info("Enrich worker — model: %s%s", config.OLLAMA_MODEL,
+    workers = _resolve_workers(args)
+    logger.info("Enrich worker — %s, model: %s, %d video(s) at a time%s",
+                llm_client.describe(), config.ENRICH_MODEL, workers,
                 "  (loop mode)" if args.loop else "")
     processed = 0
     failures = 0
@@ -848,13 +967,12 @@ def cmd_enrich(args: argparse.Namespace) -> bool:
                 continue
             break
 
-        for video_id in pending:
+        def enrich_one(video_id: str) -> str:
             rec = index.get(video_id)
             if rec is None:
                 logger.warning("No dataset.jsonl record for %s — marking failed.", video_id)
                 db.set_enrichment_status(video_id, "failed")
-                failures += 1
-                continue
+                return "failed"
             logger.info("Enriching %s — %s", video_id, rec.get("title", ""))
             try:
                 outcome = _enrich_one(video_id, rec, args.blob_dir)
@@ -865,13 +983,13 @@ def cmd_enrich(args: argparse.Namespace) -> bool:
                 except Exception:
                     pass
                 outcome = "error"
-            logger.info("  → %s", outcome)
+            logger.info("  %s → %s", video_id, outcome)
+            return outcome
+
+        for _, outcome in _run_pool(pending, enrich_one, workers):
             if outcome in {"failed", "error"}:
                 failures += 1
             processed += 1
-            if args.limit and processed >= args.limit:
-                logger.info("Reached --limit %d.", args.limit)
-                return _enrich_summary(processed, failures)
 
         if not args.loop:
             break
@@ -900,12 +1018,12 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     Nothing is written to the DB or blob storage — this is read-only measurement.
     """
     if not llm_processor.is_available():
-        logger.error("Ollama unreachable at %s — start it (`ollama serve`) and retry.",
-                     config.OLLAMA_HOST)
+        logger.error("LLM provider unreachable (%s) — check it and retry.",
+                     llm_client.describe())
         return
 
     models = ([m.strip() for m in args.models.split(",") if m.strip()]
-              if args.models else [config.OLLAMA_MODEL])
+              if args.models else [config.ENRICH_MODEL])
 
     index = _load_records_index(args.raw_dir)
     if not index:
@@ -936,11 +1054,11 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
           f"{input_words} words fed to each model")
     print(f"Models: {', '.join(models)}\n")
 
-    original_model = config.OLLAMA_MODEL
+    original_model = config.ENRICH_MODEL
     rows = []
     try:
         for model in models:
-            config.OLLAMA_MODEL = model
+            config.ENRICH_MODEL = model
             logger.info("Benchmarking %s …", model)
             llm_processor.reset_call_stats()
             result = llm_processor.enrich(meta["title"], cleaned_text, chapters)
@@ -959,7 +1077,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
                 "enrichment": e,
             })
     finally:
-        config.OLLAMA_MODEL = original_model
+        config.ENRICH_MODEL = original_model
 
     # Summary table
     print(f"\n{'model':<26}{'ok':<5}{'wall(s)':<10}{'gen tok/s':<12}"
@@ -1013,6 +1131,10 @@ def cmd_ingest(args: argparse.Namespace) -> bool:
     them as ingested in PostgreSQL. Existing destination files are not copied
     again, but their database state is repaired when necessary.
 
+    The destination is the reviewed tier, so a document regenerated upstream
+    (rewrite, re-enrich) does NOT silently overwrite it. Drift is reported and
+    `--republish` closes it deliberately.
+
     You can delete unwanted files from blob storage before running ingest —
     only what's in the blob dir gets ingested.
     """
@@ -1029,7 +1151,12 @@ def cmd_ingest(args: argparse.Namespace) -> bool:
 
     logger.info("Ingesting from %s → %s", blob_dir, clean_dir)
 
-    copied, skipped, errors = 0, 0, 0
+    # Regenerating a document does not republish it over the reviewed copy
+    # unless asked; see the drift branch below.
+    republish = getattr(args, "republish", False)
+    stale: list[str] = []
+
+    copied, updated, skipped, errors = 0, 0, 0, 0
     for root, _, files in os.walk(blob_dir):
         for fname in files:
             if not fname.endswith(".md"):
@@ -1048,13 +1175,34 @@ def cmd_ingest(args: argparse.Namespace) -> bool:
 
                 if os.path.exists(dst):
                     with open(dst, encoding="utf-8") as f:
-                        destination_video_id = _extract_video_id(f.read())
+                        published = f.read()
+                    destination_video_id = _extract_video_id(published)
                     if destination_video_id != video_id:
                         raise ValueError(
                             f"Destination identity mismatch at {dst}: "
                             f"source={video_id}, destination={destination_video_id or 'no video id'}"
                         )
-                    skipped += 1
+                    # Same video, different bytes = the document was regenerated
+                    # (re-clean, rewrite, re-enrich) and what is published is
+                    # now behind blob storage.
+                    #
+                    # The destination is the *reviewed* tier, so a regenerated
+                    # document does not get to overwrite it on its own — a hand
+                    # -edited copy would be destroyed with no way to notice.
+                    # But staying quiet was its own failure: re-running the
+                    # pipeline through a better model updated blob storage,
+                    # reported success, and changed nothing a reader would ever
+                    # see. So the default now *reports* the drift, and
+                    # --republish is the deliberate way to close it.
+                    if published == content:
+                        skipped += 1
+                    elif republish:
+                        shutil.copy2(src, dst)
+                        logger.info("Republished → %s", dst)
+                        updated += 1
+                    else:
+                        stale.append(dst)
+                        skipped += 1
                 else:
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(src, dst)
@@ -1083,9 +1231,23 @@ def cmd_ingest(args: argparse.Namespace) -> bool:
                 errors += 1
 
     logger.info(
-        "Ingest done. %d copied to /srv/dbdata, %d already existed, %d errors.",
-        copied, skipped, errors,
+        "Ingest done. %d new, %d republished, %d unchanged, %d errors.",
+        copied, updated, skipped, errors,
     )
+    if stale:
+        logger.warning(
+            "%d published document(s) are BEHIND blob storage — regenerated but "
+            "not republished, so %s still serves the older text.",
+            len(stale), clean_dir,
+        )
+        for path in stale[:5]:
+            logger.warning("  stale: %s", path)
+        if len(stale) > 5:
+            logger.warning("  … and %d more", len(stale) - 5)
+        logger.warning(
+            "Re-run with --republish to overwrite them. This replaces the "
+            "reviewed copy, so any hand edits there are lost."
+        )
     return errors == 0
 
 
@@ -1153,6 +1315,122 @@ def cmd_setup_db(args: argparse.Namespace) -> None:
 
 # ── CLI wiring ────────────────────────────────────────────────────────────
 
+def cmd_check_llm(args: argparse.Namespace) -> bool:
+    """
+    Verify the configured provider actually answers, before a long run commits
+    to it. Sends two tiny requests — one plain, one schema-constrained — because
+    those are the two shapes the pipeline depends on and structured output is
+    the one that varies between OpenAI-compatible providers.
+    """
+    print(f"\nProvider : {llm_client.describe()}")
+    print(f"Billing  : {config.LLM_BILLING_MODE}")
+    print(f"Rewrite  : {config.REWRITE_MODEL}")
+    print(f"Enrich   : {config.ENRICH_MODEL}")
+    if config.LLM_PROVIDER != "ollama":
+        key = config.LLM_API_KEY
+        print(f"API key  : {'set (' + str(len(key)) + ' chars)' if key else 'MISSING'}")
+        if not key:
+            logger.error("LLM_API_KEY is empty — put your key in .env and retry.")
+            return False
+
+    ok = True
+    for label, model in (("rewrite", config.REWRITE_MODEL), ("enrich", config.ENRICH_MODEL)):
+        print(f"\n── {label}: {model} ──")
+
+        plain = llm_client.chat(
+            model=model, system="You are terse.",
+            user="Reply with exactly: PONG", temperature=0.0, max_tokens=20, timeout=60,
+        )
+        if plain.ok:
+            print(f"  text     ✓  {plain.text.strip()[:60]!r} "
+                  f"({plain.duration_ms} ms, {plain.usage.total_tokens} tokens)")
+        else:
+            print(f"  text     ✗  {plain.error}")
+            ok = False
+            continue
+
+        schema = {"type": "object",
+                  "properties": {"colour": {"type": "string"}},
+                  "required": ["colour"]}
+        structured = llm_client.chat(
+            model=model, system="You output JSON only.",
+            user="Name one primary colour as {\"colour\": \"...\"}.",
+            temperature=0.0, schema=schema, max_tokens=60, timeout=60,
+        )
+        if structured.ok:
+            print(f"  json     ✓  {structured.data} ({structured.duration_ms} ms)")
+        else:
+            print(f"  json     ✗  {structured.error}")
+            # Enrichment needs JSON; a rewrite model that cannot do it is fine.
+            if label == "enrich":
+                ok = False
+
+    print("\n" + ("All checks passed." if ok else "Some checks failed — see above.") + "\n")
+    return ok
+
+
+def cmd_requeue(args: argparse.Namespace) -> bool:
+    """
+    Put blocked or failed videos back in a stage's queue.
+
+    The counterpart to the attempt ceiling: the ceiling exists so one broken
+    video cannot starve the queue behind it, and this is how the casualties come
+    back once whatever broke them is fixed.
+    """
+    if not _db_available():
+        logger.error("requeue needs DATABASE_URL — the queue lives in PostgreSQL.")
+        return False
+    moved = db.requeue(args.videos, stage=args.stage)
+    if moved:
+        logger.info("Requeued %d video(s) for %s.", moved, args.stage)
+    else:
+        logger.info("Nothing to requeue for %s.", args.stage)
+    return True
+
+
+def cmd_usage(args: argparse.Namespace) -> bool:
+    """
+    Report token usage, and cost where cost is a real number.
+
+    Subscription runs show a zero cost because that is the truth: the marginal
+    cost of the call was zero. Metered runs with no matching model_pricing row
+    show as unpriced rather than as free — an unknown cost and a zero cost are
+    different facts and collapsing them is how usage reporting starts lying.
+    """
+    if not _db_available():
+        logger.error("usage needs DATABASE_URL.")
+        return False
+
+    rows = db.usage_summary(days=args.days)
+    if not rows:
+        logger.info("No LLM runs in the last %d days.", args.days)
+        return True
+
+    print(f"\nLLM usage — last {args.days} days\n")
+    print(f"{'stage':<9}{'provider':<11}{'model':<20}{'runs':>6}{'in':>12}{'out':>12}"
+          f"{'billing':>14}{'cost':>12}")
+    print("-" * 96)
+    for r in rows:
+        if r["billing_mode"] == "subscription":
+            cost = "included"
+        elif r["cost_usd"] is None:
+            cost = "unpriced"
+        else:
+            cost = f"${r['cost_usd']:.4f}"
+        print(f"{r['stage'] or '-':<9}{r['provider'] or '-':<11}{r['model'][:19]:<20}"
+              f"{r['runs']:>6}{r['prompt_tokens'] or 0:>12,}{r['completion_tokens'] or 0:>12,}"
+              f"{r['billing_mode'] or '-':>14}{cost:>12}")
+
+    unpriced = [r for r in rows
+                if r["billing_mode"] != "subscription" and r["cost_usd"] is None]
+    if unpriced:
+        print("\nSome runs have no price on record. Add rates to price them:")
+        print("  INSERT INTO model_pricing (provider, model, input_per_mtok, output_per_mtok)")
+        print("  VALUES ('openai', 'glm-4.6', 0.60, 2.20);")
+    print()
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="YouTube transcript scraper — scrape → clean → ingest",
@@ -1197,6 +1475,8 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--limit", type=int, default=0, help="Max videos to enrich this run (0 = all pending)")
     ep.add_argument("--loop",  action="store_true", help="Keep polling for new work instead of exiting")
     ep.add_argument("--poll",  type=int, default=60, help="Seconds between polls in --loop mode")
+    ep.add_argument("--workers", type=int, default=None,
+                    help="Videos to process at once (0 = auto: 1 local, 4 hosted). Chunks within a video stay sequential.")
 
     # rewrite
     rp = sub.add_parser("rewrite", help="Rewrite cleaned transcripts into readable articles (resumable)")
@@ -1205,6 +1485,8 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--limit", type=int, default=0, help="Max videos to rewrite this run (0 = all pending)")
     rp.add_argument("--loop",  action="store_true", help="Keep polling for new work instead of exiting")
     rp.add_argument("--poll",  type=int, default=60, help="Seconds between polls in --loop mode")
+    rp.add_argument("--workers", type=int, default=None,
+                    help="Videos to process at once (0 = auto: 1 local, 4 hosted). Chunks within a video stay sequential.")
 
     # benchmark
     bp = sub.add_parser("benchmark", help="Compare models on the same transcript (speed + output)")
@@ -1219,9 +1501,25 @@ def build_parser() -> argparse.ArgumentParser:
     ip = sub.add_parser("ingest", help="Copy approved files from blob storage → /srv/dbdata")
     ip.add_argument("--blob-dir",  default=config.BLOB_OUTPUT_DIR)
     ip.add_argument("--clean-dir", default=config.CLEAN_OUTPUT_DIR)
+    ip.add_argument("--republish", action="store_true",
+                    help="Overwrite published documents that regeneration has left stale. "
+                         "Destroys hand edits made to the reviewed copy.")
 
     # setup-db
     sub.add_parser("setup-db", help="Create database and apply schema (reads DATABASE_URL from .env)")
+
+    # check-llm
+    sub.add_parser("check-llm", help="Verify the configured LLM provider answers (2 tiny calls)")
+
+    # requeue
+    qp = sub.add_parser("requeue", help="Return blocked/failed videos to a stage's queue")
+    qp.add_argument("--stage", choices=("rewrite", "enrichment"), required=True)
+    qp.add_argument("--video", action="append", dest="videos", metavar="VIDEO_ID",
+                    help="Requeue only this video (repeatable). Default: every blocked one.")
+
+    # usage
+    up = sub.add_parser("usage", help="Token usage and derived cost by model and stage")
+    up.add_argument("--days", type=int, default=30, help="Look back this many days (default 30)")
 
     return parser
 
@@ -1237,6 +1535,9 @@ def main() -> None:
         "benchmark": cmd_benchmark,
         "ingest":    cmd_ingest,
         "setup-db":  cmd_setup_db,
+        "requeue":   cmd_requeue,
+        "usage":     cmd_usage,
+        "check-llm": cmd_check_llm,
     }[args.command]
     if command(args) is False:
         raise SystemExit(1)

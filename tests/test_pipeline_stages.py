@@ -1,12 +1,15 @@
 import argparse
+import contextlib
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
+import config
 import main as pipeline
 from scraper import llm_processor
 
@@ -240,8 +243,9 @@ class CleanStageOutcomeTests(unittest.TestCase):
 
 class IngestStageOutcomeTests(unittest.TestCase):
     @staticmethod
-    def _args(blob_dir, clean_dir):
-        return argparse.Namespace(blob_dir=blob_dir, clean_dir=clean_dir)
+    def _args(blob_dir, clean_dir, republish=False):
+        return argparse.Namespace(blob_dir=blob_dir, clean_dir=clean_dir,
+                                  republish=republish)
 
     @staticmethod
     def _stage_destination(clean_dir, content):
@@ -334,6 +338,67 @@ class IngestStageOutcomeTests(unittest.TestCase):
                         [{k: dst if v == "<dst>" else v for k, v in expected.items()}
                          for expected in expected_updates],
                     )
+
+    def test_regenerated_document_does_not_overwrite_the_reviewed_copy(self):
+        """
+        /srv/dbdata is the reviewed tier. A rewrite or re-enrich upstream must
+        not silently replace a copy someone may have edited by hand.
+        """
+        fake_db = _FakeDb({VIDEO_ID: {"status": "ingested", "clean_path": "<dst>"}})
+        with (
+            tempfile.TemporaryDirectory() as blob_dir,
+            tempfile.TemporaryDirectory() as clean_dir,
+            patch.object(pipeline, "_db_available", return_value=True),
+            patch.object(pipeline, "db", fake_db),
+        ):
+            _write_blob(blob_dir, BLOB_DOCUMENT)
+            dst = self._stage_destination(clean_dir, REVIEWED_COPY)
+
+            result = pipeline.cmd_ingest(self._args(blob_dir, clean_dir))
+
+            self.assertIs(result, True, "drift is reported, not a stage failure")
+            with open(dst, encoding="utf-8") as f:
+                self.assertEqual(f.read(), REVIEWED_COPY)
+
+    def test_republish_updates_a_stale_published_document(self):
+        """
+        The counterpart: without this, regenerating the corpus through a better
+        model updates blob storage, reports success, and changes nothing a
+        reader ever sees.
+        """
+        fake_db = _FakeDb({VIDEO_ID: {"status": "ingested", "clean_path": "<dst>"}})
+        with (
+            tempfile.TemporaryDirectory() as blob_dir,
+            tempfile.TemporaryDirectory() as clean_dir,
+            patch.object(pipeline, "_db_available", return_value=True),
+            patch.object(pipeline, "db", fake_db),
+        ):
+            _write_blob(blob_dir, BLOB_DOCUMENT)
+            dst = self._stage_destination(clean_dir, REVIEWED_COPY)
+
+            result = pipeline.cmd_ingest(self._args(blob_dir, clean_dir, republish=True))
+
+            self.assertIs(result, True)
+            with open(dst, encoding="utf-8") as f:
+                self.assertEqual(f.read(), BLOB_DOCUMENT)
+
+    def test_republish_still_refuses_a_destination_holding_another_video(self):
+        """Republishing relaxes staleness, never identity."""
+        fake_db = _FakeDb({VIDEO_ID: {"status": "ingested"}})
+        with (
+            tempfile.TemporaryDirectory() as blob_dir,
+            tempfile.TemporaryDirectory() as clean_dir,
+            patch.object(pipeline, "_db_available", return_value=True),
+            patch.object(pipeline, "db", fake_db),
+        ):
+            _write_blob(blob_dir, BLOB_DOCUMENT)
+            dst = self._stage_destination(clean_dir, FOREIGN_DOCUMENT)
+
+            result = pipeline.cmd_ingest(self._args(blob_dir, clean_dir, republish=True))
+
+            self.assertIs(result, False)
+            with open(dst, encoding="utf-8") as f:
+                self.assertEqual(f.read(), FOREIGN_DOCUMENT)
 
     def test_destination_holding_a_different_video_is_rejected(self):
         cases = [
@@ -550,6 +615,96 @@ class CliExitCodeTests(unittest.TestCase):
                         self.assertEqual(raised.exception.code, expected_code)
 
                     self.assertEqual(command.call_count, 1)
+
+
+class WorkerPoolTests(unittest.TestCase):
+    """
+    Videos are independent, so they are processed concurrently; chunks inside a
+    video are not, and stay sequential in rewriter.rewrite().
+    """
+
+    def test_auto_workers_stay_serial_for_a_local_model(self):
+        # Parallel calls to one Ollama GPU contend for it and gain nothing.
+        with patch.object(config, "LLM_PROVIDER", "ollama"), \
+                patch.object(config, "LLM_WORKERS", 0):
+            self.assertEqual(pipeline._resolve_workers(argparse.Namespace()), 1)
+
+    def test_auto_workers_parallelise_for_a_hosted_model(self):
+        with patch.object(config, "LLM_PROVIDER", "openai"), \
+                patch.object(config, "LLM_WORKERS", 0):
+            self.assertGreater(pipeline._resolve_workers(argparse.Namespace()), 1)
+
+    def test_explicit_workers_beat_the_auto_default(self):
+        with patch.object(config, "LLM_PROVIDER", "openai"), \
+                patch.object(config, "LLM_WORKERS", 0):
+            self.assertEqual(pipeline._resolve_workers(argparse.Namespace(workers=2)), 2)
+
+    def test_every_video_is_processed_exactly_once(self):
+        seen = []
+        lock = threading.Lock()
+
+        def work(video_id):
+            with lock:
+                seen.append(video_id)
+            return "done"
+
+        ids = [f"vid{i}" for i in range(12)]
+        results = pipeline._run_pool(ids, work, workers=4)
+
+        self.assertCountEqual(seen, ids, "a video was dropped or done twice")
+        self.assertCountEqual([vid for vid, _ in results], ids)
+        self.assertTrue(all(outcome == "done" for _, outcome in results))
+
+    def test_videos_actually_run_concurrently(self):
+        """Four workers must overlap; a serial pool would defeat the point."""
+        active, peak = 0, 0
+        lock = threading.Lock()
+
+        def work(video_id):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return "done"
+
+        pipeline._run_pool([f"vid{i}" for i in range(8)], work, workers=4)
+        self.assertGreater(peak, 1, "pool ran serially")
+
+    def test_a_failing_video_does_not_take_down_the_batch(self):
+        def work(video_id):
+            if video_id == "vid3":
+                raise RuntimeError("boom")
+            return "done"
+
+        # The stage wraps its own work function in try/except; the pool itself
+        # propagates, so an unguarded raise must not be silently swallowed.
+        with self.assertRaises(RuntimeError):
+            pipeline._run_pool([f"vid{i}" for i in range(6)], work, workers=3)
+
+    def test_workers_adopt_the_caller_log_context(self):
+        """
+        Without this the parallel rewrite runs invisibly in the web UI: log
+        records are routed to a job by thread id, and pool threads are unknown.
+        """
+        adopted = []
+
+        @contextlib.contextmanager
+        def adopt():
+            adopted.append(threading.current_thread().ident)
+            yield
+
+        with patch.object(pipeline, "worker_thread_hook", lambda: adopt):
+            pipeline._run_pool(["a", "b", "c", "d"], lambda vid: "done", workers=2)
+
+        self.assertEqual(len(adopted), 4, "not every worker adopted the job context")
+
+    def test_no_hook_outside_the_web_ui_is_harmless(self):
+        with patch.object(pipeline, "worker_thread_hook", None):
+            results = pipeline._run_pool(["a", "b"], lambda vid: "done", workers=2)
+        self.assertEqual(len(results), 2)
 
 
 if __name__ == "__main__":

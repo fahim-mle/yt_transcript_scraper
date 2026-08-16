@@ -79,12 +79,41 @@ MIN_WORD_COUNT = 200        # reject transcripts shorter than this after cleanin
 PARAGRAPH_MIN_WORDS = 60    # minimum words before a paragraph break is allowed
 PARAGRAPH_GAP_SECONDS = 2.0  # silence gap that forces a paragraph break
 
-# ── LLM enrichment (clean stage) ───────────────────────────────────────────
+# ── LLM provider gateway ───────────────────────────────────────────────────
+# Both LLM stages (rewrite, enrich) talk to one gateway rather than to Ollama
+# directly, so the same pipeline runs against a local model or a hosted one
+# with no code change — only these three settings move.
+#
+#   LLM_PROVIDER=ollama   → local, free, slow. Uses OLLAMA_HOST.
+#   LLM_PROVIDER=openai   → any OpenAI-compatible /chat/completions endpoint
+#                           (Z.ai/GLM, OpenRouter, Together, vLLM, …).
+#                           Uses LLM_BASE_URL + LLM_API_KEY.
+#
+# "openai" names the wire protocol, not the vendor. Point LLM_BASE_URL at
+# whichever gateway holds the key you want this pipeline to spend.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+# Base URL *without* the trailing /chat/completions — that path is appended.
+#   Z.ai (international):  https://api.z.ai/api/paas/v4
+#   BigModel (mainland):   https://open.bigmodel.cn/api/paas/v4
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+# Extra JSON merged into every request body, for provider-specific knobs that
+# would be meaningless elsewhere — e.g. GLM's thinking switch:
+#   LLM_EXTRA_BODY={"thinking": {"type": "disabled"}}
+# Kept generic on purpose: sniffing the model name to decide what to send is
+# how a gateway grows a hardcoded vendor list.
+LLM_EXTRA_BODY = os.getenv("LLM_EXTRA_BODY", "")
+
+# ── LLM enrichment (enrich stage) ──────────────────────────────────────────
 # Content metadata (summary, key concepts, domains, difficulty, sections) is
-# derived from the cleaned transcript by a local Ollama model during `clean`.
+# derived from the cleaned transcript during `enrich`.
 # Set LLM_ENABLED=0 to skip enrichment and produce plain clean .md files.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+# Model for the enrichment stage. Named ENRICH_MODEL because it is no longer
+# necessarily an Ollama model; OLLAMA_MODEL is kept as an alias below so
+# existing .env files and setup.sh's probe keep working.
+ENRICH_MODEL = os.getenv("ENRICH_MODEL", os.getenv("OLLAMA_MODEL", "qwen3.5:9b"))
+OLLAMA_MODEL = ENRICH_MODEL
 LLM_ENABLED = os.getenv("LLM_ENABLED", "1") == "1"
 # Context window for the model. Must comfortably hold the capped transcript
 # (~1.3 tokens/word) plus prompt and JSON output, or the input gets truncated.
@@ -129,6 +158,39 @@ REWRITE_MAX_RATIO = float(os.getenv("REWRITE_MAX_RATIO", "1.60"))
 REWRITE_MIN_RETENTION = float(os.getenv("REWRITE_MIN_RETENTION", "0.72"))
 # Retries at lower temperature before falling back to the verbatim chunk.
 REWRITE_MAX_ATTEMPTS = int(os.getenv("REWRITE_MAX_ATTEMPTS", "2"))
+# Chunk-level checkpointing. A long rewrite is hours of work; without this,
+# stopping the job at 90% discards everything and the next run restarts the
+# same video at chunk 1 — which is exactly what made the queue head look like
+# it was "starting over" forever. Progress is written under
+# <raw_dir>/.rewrite_progress/<video_id>.json and removed on success.
+REWRITE_CHECKPOINT = os.getenv("REWRITE_CHECKPOINT", "1") == "1"
+
+# How many videos to process at once in the rewrite/enrich workers.
+#   0 = auto: 1 against a local model, 4 against a hosted endpoint.
+# Chunks *within* a video stay sequential — each one is fed the previous
+# chunk's output as context, which is what makes prose flow across the seam.
+# Videos are independent, so that is where the parallelism goes. Against Ollama
+# concurrency is counterproductive (calls just contend for the same GPU); against
+# a hosted API the worker is I/O-bound and mostly idle, so it is nearly free.
+LLM_WORKERS = int(os.getenv("LLM_WORKERS", "0"))
+
+# ── Queue behaviour ────────────────────────────────────────────────────────
+# A video that fails is retried on the next run. Without a ceiling it sits at
+# the head of a FIFO queue forever, blocking every video behind it — the same
+# failure re-attempted every run is not resilience, it is a stuck pipeline.
+# Past this many attempts a video moves to 'blocked' and is skipped until it
+# is explicitly requeued.
+QUEUE_MAX_ATTEMPTS = int(os.getenv("QUEUE_MAX_ATTEMPTS", "3"))
+
+# ── Usage accounting ───────────────────────────────────────────────────────
+# Token counts are recorded as fact for every LLM call. Money is NOT: on a
+# subscription the marginal cost of a call is zero, so writing a dollar figure
+# next to it would be a fabricated number that later analysis would trust.
+#   subscription → tokens recorded, cost_usd left NULL
+#   api          → tokens recorded, cost derived from the model_pricing table
+# Switching later means changing this value and inserting a pricing row; the
+# historical token counts stay valid and can be priced retroactively.
+LLM_BILLING_MODE = os.getenv("LLM_BILLING_MODE", "subscription").strip().lower()
 
 # ── Database ───────────────────────────────────────────────────────────────
 # Set DATABASE_URL in your .env file, e.g.:

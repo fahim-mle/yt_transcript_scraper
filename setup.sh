@@ -94,11 +94,22 @@ ensure_model() {  # ensure_model <tag> <purpose>
     fi
 }
 
-say "LLM models (Ollama)"
-if command -v ollama >/dev/null; then
+say "LLM models"
+LLM_PROVIDER_NAME="$(ask_config LLM_PROVIDER)"
+if [[ "$LLM_PROVIDER_NAME" != "ollama" ]]; then
+    # A hosted provider's model names are not Ollama tags — pulling them would
+    # fail, and there is nothing local to install.
+    ok "provider '$LLM_PROVIDER_NAME' is remote — no local models to pull"
+    if [[ -z "$(ask_config LLM_API_KEY)" ]]; then
+        warn "LLM_API_KEY is empty — set it in .env, then verify with:"
+        warn "  .venv/bin/python main.py check-llm"
+    else
+        ok "LLM_API_KEY is set — verify with:  .venv/bin/python main.py check-llm"
+    fi
+elif command -v ollama >/dev/null; then
     OLLAMA_HOST_URL="$(ask_config OLLAMA_HOST)"
     if curl -sf "${OLLAMA_HOST_URL:-http://localhost:11434}/api/tags" >/dev/null 2>&1; then
-        ensure_model "$(ask_config OLLAMA_MODEL)"  "enrichment"
+        ensure_model "$(ask_config ENRICH_MODEL)"  "enrichment"
         [[ "$(ask_config REWRITE_ENABLED)" == "True" ]] \
             && ensure_model "$(ask_config REWRITE_MODEL)" "rewrite"
     else

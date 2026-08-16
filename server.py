@@ -11,6 +11,7 @@ Then open: http://localhost:8000
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -55,9 +56,42 @@ _job_handler = _JobLogHandler()
 _job_handler.setFormatter(_fmt)
 _root.addHandler(_job_handler)
 
+
+def _job_thread_context():
+    """
+    Capture the calling thread's job binding so worker threads can adopt it.
+
+    Records are routed to a job by thread id, so a pool worker spawned inside a
+    stage is invisible to the UI — the whole parallel rewrite would run in
+    silence. Called once on the job thread; the returned context manager is
+    entered by each worker.
+    """
+    with _tjm_lock:
+        job_id = _thread_job_map.get(threading.current_thread().ident)
+
+    @contextlib.contextmanager
+    def adopt():
+        if job_id is None:
+            yield
+            return
+        tid = threading.current_thread().ident
+        with _tjm_lock:
+            _thread_job_map[tid] = job_id
+        try:
+            yield
+        finally:
+            with _tjm_lock:
+                _thread_job_map.pop(tid, None)
+
+    return adopt
+
 # Pipeline imports (safe now that logging is configured)
 import config  # loads .env on import
 import main as pipeline
+
+# Let the pipeline's worker pools inherit this job's log routing, so a parallel
+# rewrite still streams to the UI instead of going dark.
+pipeline.worker_thread_hook = _job_thread_context
 
 from fastapi import FastAPI, Header
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
